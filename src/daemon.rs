@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::{BufRead, BufReader, ErrorKind, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, mpsc},
@@ -91,6 +91,11 @@ pub enum Request {
         name: String,
         copy_worktree: bool,
     },
+    Attach {
+        id: String,
+        read_only: bool,
+        history_bytes: usize,
+    },
     TracePath,
     Shutdown,
 }
@@ -107,6 +112,7 @@ pub enum ResponsePayload {
     Sessions(Vec<SessionMetadata>),
     Proof(ProofBundle),
     Forked(ForkResult),
+    Attached,
     TracePath(PathBuf),
     Shutdown,
 }
@@ -219,6 +225,7 @@ fn handle_request_inner(manager: &SessionManager, request: Request) -> Result<Re
             &name,
             copy_worktree,
         )?)),
+        Request::Attach { .. } => bail!("attach is only supported by the Unix socket stream"),
         Request::TracePath => Ok(ResponsePayload::TracePath(
             manager.trace_path().to_path_buf(),
         )),
@@ -254,6 +261,7 @@ impl Request {
             Request::List => "terminal.list",
             Request::Proof { .. } => "terminal.proof",
             Request::Fork { .. } => "terminal.fork",
+            Request::Attach { .. } => "terminal.attach",
             Request::TracePath => "terminal.trace_path",
             Request::Shutdown => "terminal.shutdown",
         }
@@ -269,7 +277,8 @@ impl Request {
             | Request::Kill { id }
             | Request::Replay { id }
             | Request::Proof { id }
-            | Request::Fork { id, .. } => Some(id.clone()),
+            | Request::Fork { id, .. }
+            | Request::Attach { id, .. } => Some(id.clone()),
             Request::List | Request::TracePath | Request::Shutdown => None,
         }
     }
@@ -403,6 +412,13 @@ fn handle_stream(mut stream: UnixStream, manager: Arc<SessionManager>) -> Result
             shutdown = matches!(request, Request::Shutdown);
             if shutdown {
                 WireResponse::ok(ResponsePayload::Shutdown)
+            } else if let Request::Attach {
+                id,
+                read_only,
+                history_bytes,
+            } = request
+            {
+                return handle_attach_stream(stream, manager, id, read_only, history_bytes);
             } else {
                 match handle_request(&manager, request) {
                     Ok(data) => WireResponse::ok(data),
@@ -416,4 +432,83 @@ fn handle_stream(mut stream: UnixStream, manager: Arc<SessionManager>) -> Result
     serde_json::to_writer(&mut stream, &response).context("serialize daemon response")?;
     stream.write_all(b"\n").context("write daemon response")?;
     Ok(shutdown)
+}
+
+fn handle_attach_stream(
+    mut stream: UnixStream,
+    manager: Arc<SessionManager>,
+    session_id: String,
+    read_only: bool,
+    history_bytes: usize,
+) -> Result<bool> {
+    if let Err(error) = manager.record_attach(&session_id) {
+        serde_json::to_writer(&mut stream, &WireResponse::error(format!("{error:#}")))
+            .context("serialize attach error response")?;
+        stream
+            .write_all(b"\n")
+            .context("write attach error response newline")?;
+        return Ok(false);
+    }
+    let (mut cursor, initial) = match manager.transcript_snapshot(&session_id, history_bytes) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            serde_json::to_writer(&mut stream, &WireResponse::error(format!("{error:#}")))
+                .context("serialize attach error response")?;
+            stream
+                .write_all(b"\n")
+                .context("write attach error response newline")?;
+            return Ok(false);
+        }
+    };
+    serde_json::to_writer(&mut stream, &WireResponse::ok(ResponsePayload::Attached))
+        .context("serialize attach response")?;
+    stream
+        .write_all(b"\n")
+        .context("write attach response newline")?;
+    if !initial.is_empty() {
+        stream
+            .write_all(initial.as_bytes())
+            .context("write initial attach transcript")?;
+        stream.flush().context("flush initial attach transcript")?;
+    }
+
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .context("set attach read timeout")?;
+    let mut input = [0_u8; 8192];
+    loop {
+        match stream.read(&mut input) {
+            Ok(0) => break,
+            Ok(count) => {
+                if !read_only {
+                    manager.send(&session_id, &input[..count])?;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error).context("read attach input"),
+        }
+
+        let (next_cursor, chunk) = manager.transcript_since(&session_id, cursor)?;
+        cursor = next_cursor;
+        if !chunk.is_empty() {
+            if let Err(error) = stream.write_all(chunk.as_bytes()) {
+                if matches!(
+                    error.kind(),
+                    ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                ) {
+                    break;
+                }
+                return Err(error).context("write attach output");
+            }
+            stream.flush().context("flush attach output")?;
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    Ok(false)
 }

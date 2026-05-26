@@ -1,17 +1,20 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{Read, Write},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitCode},
+    thread,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use agent_pty::{
-    daemon::{Request, ResponsePayload, parse_duration, request_unix, serve_unix},
+    daemon::{Request, ResponsePayload, WireResponse, parse_duration, request_unix, serve_unix},
     demo::{DemoOptions, run_demo},
     evidence::{Action, EventKind},
     http::serve_http,
@@ -106,6 +109,19 @@ enum Command {
         /// Send bytes without appending Enter.
         #[arg(long)]
         no_enter: bool,
+    },
+    /// Attach this terminal to a live session over the Unix socket.
+    Attach {
+        name: String,
+        /// Stream output without forwarding stdin into the session.
+        #[arg(long)]
+        read_only: bool,
+        /// Exit automatically after a duration, useful for scripts and smoke tests.
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Initial transcript bytes to replay before live output.
+        #[arg(long, default_value_t = 12_000)]
+        history_bytes: usize,
     },
     /// Read the current semantic screen snapshot.
     Screen {
@@ -301,6 +317,19 @@ fn run() -> Result<()> {
             )?;
             print_payload(payload, OutputFormat::Text, false)
         }
+        Command::Attach {
+            name,
+            read_only,
+            timeout,
+            history_bytes,
+        } => {
+            let timeout = timeout
+                .as_deref()
+                .map(parse_duration)
+                .transpose()
+                .with_context(|| format!("invalid attach timeout {timeout:?}"))?;
+            attach_unix(&socket, &name, read_only, timeout, history_bytes)
+        }
         Command::Screen { name, format } => {
             let payload = request_unix(socket, &Request::Screen { id: name })?;
             print_payload(payload, format, false)
@@ -421,6 +450,7 @@ fn print_payload(payload: ResponsePayload, format: OutputFormat, force_json: boo
         }
         ResponsePayload::TracePath(path) => println!("{}", path.display()),
         ResponsePayload::Shutdown => println!("stopped"),
+        ResponsePayload::Attached => println!("attached"),
         ResponsePayload::Screen(screen) => match format {
             OutputFormat::Text => print!("{}", screen.text),
             OutputFormat::Markdown => println!("```text\n{}\n```", screen.text.trim_end()),
@@ -449,6 +479,95 @@ fn print_payload(payload: ResponsePayload, format: OutputFormat, force_json: boo
         }
     }
     Ok(())
+}
+
+fn attach_unix(
+    socket: &Path,
+    session_id: &str,
+    read_only: bool,
+    timeout: Option<Duration>,
+    history_bytes: usize,
+) -> Result<()> {
+    let mut stream =
+        UnixStream::connect(socket).with_context(|| format!("connect to {}", socket.display()))?;
+    serde_json::to_writer(
+        &mut stream,
+        &Request::Attach {
+            id: session_id.to_string(),
+            read_only,
+            history_bytes,
+        },
+    )
+    .context("serialize attach request")?;
+    stream.write_all(b"\n").context("write attach newline")?;
+    stream.flush().context("flush attach request")?;
+
+    let response = read_wire_response(&mut stream)?;
+    if !response.ok {
+        bail!(
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "attach failed".to_string())
+        );
+    }
+    if !matches!(response.data, Some(ResponsePayload::Attached)) {
+        bail!("daemon did not enter attach mode");
+    }
+
+    if !read_only {
+        let mut input_stream = stream.try_clone().context("clone attach input stream")?;
+        thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let _ = std::io::copy(&mut stdin, &mut input_stream);
+        });
+    }
+
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .context("set attach output timeout")?;
+    let deadline = timeout.map(|duration| Instant::now() + duration);
+    let mut output = std::io::stdout().lock();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                output
+                    .write_all(&buffer[..count])
+                    .context("write attach output")?;
+                output.flush().context("flush attach output")?;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error).context("read attach output"),
+        }
+    }
+    Ok(())
+}
+
+fn read_wire_response(stream: &mut UnixStream) -> Result<WireResponse> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let count = stream.read(&mut byte).context("read attach response")?;
+        if count == 0 {
+            bail!("daemon closed before attach response");
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    serde_json::from_slice(&line).context("parse attach response")
 }
 
 #[derive(Debug, Clone, Serialize)]
