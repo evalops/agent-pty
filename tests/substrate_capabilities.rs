@@ -58,6 +58,8 @@ fn manager_persists_session_metadata_and_writes_proof_bundle() {
             .any(|command| command.contains("printf"))
     );
     assert!(proof.screen_tail.contains("proof-ok"));
+    assert!(proof.log_integrity.verified);
+    assert_eq!(proof.log_integrity.event_count, proof.event_count);
     assert!(proof.event_count >= 4);
     assert!(proof.json_path.exists());
     assert!(proof.markdown_path.exists());
