@@ -250,10 +250,15 @@ must proof_a "$BIN" --socket "$SOCKET" proof fix-a
 must proof_b "$BIN" --socket "$SOCKET" proof fix-b
 cp "$LOG_DIR/proofs/fix-a.proof.md" "$ARTIFACTS/proofs/fix-a.proof.md"
 cp "$LOG_DIR/proofs/fix-b.proof.md" "$ARTIFACTS/proofs/fix-b.proof.md"
+cp "$LOG_DIR/proofs/fix-a.proof.html" "$ARTIFACTS/proofs/fix-a.proof.html"
+must proof_a_html "$BIN" --socket "$SOCKET" proof fix-a --html
 assert_contains "$ARTIFACTS/proofs/fix-a.proof.md" "cargo test"
 assert_contains "$ARTIFACTS/proofs/fix-a.proof.md" "test result: ok"
 assert_contains "$ARTIFACTS/proofs/fix-a.proof.md" "tests passed"
 assert_contains "$ARTIFACTS/proofs/fix-b.proof.md" "test result: FAILED"
+assert_contains "$ARTIFACTS/proofs/fix-a.proof.html" "agent-pty proof: fix-a"
+assert_contains "$ARTIFACTS/proofs/fix-a.proof.html" "Commands Run"
+assert_contains "$ARTIFACTS/proof_a_html.out" "fix-a.proof.html"
 
 for i in $(seq 1 12); do
   "$BIN" --socket "$SOCKET" replay fix-a --json >"$ARTIFACTS/concurrent/replay-$i.json" &
@@ -376,5 +381,6 @@ grep -F "tmux reconnect: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "daemon restart replay: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "fork comparison: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "tests passed" "$ARTIFACTS/proofs/fix-a.proof.md" >/dev/null
+grep -F "Commands Run" "$ARTIFACTS/proofs/fix-a.proof.html" >/dev/null
 
 echo "$ARTIFACTS"

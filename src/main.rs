@@ -182,11 +182,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Write a JSON and Markdown proof bundle for a session.
+    /// Write JSON, Markdown, and HTML proof artifacts for a session.
     Proof {
         name: String,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        html: bool,
     },
     /// Fork a session, optionally with a git worktree-backed workspace.
     Fork {
@@ -274,6 +276,7 @@ fn run() -> Result<()> {
                 println!("workspace: {}", summary.workspace.display());
                 println!("report: {}", summary.report_path.display());
                 println!("proof: {}", summary.proof_markdown_path.display());
+                println!("proof html: {}", summary.proof_html_path.display());
                 println!("event log: {}", summary.event_log_path.display());
             }
             Ok(())
@@ -452,14 +455,26 @@ fn run() -> Result<()> {
             };
             print_payload(payload, format, false)
         }
-        Command::Proof { name, json } => {
+        Command::Proof { name, json, html } => {
+            if json && html {
+                bail!("--json and --html cannot be used together");
+            }
             let payload = request_unix(socket, &Request::Proof { id: name })?;
-            let format = if json {
-                OutputFormat::Json
-            } else {
-                OutputFormat::Text
-            };
-            print_payload(payload, format, false)
+            match payload {
+                ResponsePayload::Proof(proof) if json => {
+                    println!("{}", serde_json::to_string_pretty(&proof)?);
+                    Ok(())
+                }
+                ResponsePayload::Proof(proof) if html => {
+                    println!("{}", proof.html_path.display());
+                    Ok(())
+                }
+                ResponsePayload::Proof(proof) => {
+                    println!("{}", proof.markdown_path.display());
+                    Ok(())
+                }
+                payload => print_payload(payload, OutputFormat::Text, false),
+            }
         }
         Command::Fork {
             name,
@@ -876,11 +891,13 @@ fn event_label(kind: &EventKind) -> String {
             Action::Proof {
                 json_path,
                 markdown_path,
+                html_path,
             } => {
                 format!(
-                    "proof json={} markdown={}",
+                    "proof json={} markdown={} html={}",
                     json_path.display(),
-                    markdown_path.display()
+                    markdown_path.display(),
+                    html_path.display()
                 )
             }
         },

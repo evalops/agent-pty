@@ -89,6 +89,7 @@ pub struct ProofBundle {
     pub log_path: PathBuf,
     pub json_path: PathBuf,
     pub markdown_path: PathBuf,
+    pub html_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -859,6 +860,9 @@ impl SessionManager {
         let markdown_path = self
             .proof_dir
             .join(format!("{}.proof.md", safe_filename(session_id)));
+        let html_path = self
+            .proof_dir
+            .join(format!("{}.proof.html", safe_filename(session_id)));
         let proof = ProofBundle {
             session_id: session_id.to_string(),
             generated_at: Utc::now(),
@@ -872,17 +876,21 @@ impl SessionManager {
             log_path: self.log_path(session_id),
             json_path,
             markdown_path,
+            html_path,
         };
 
         fs::write(&proof.json_path, serde_json::to_vec_pretty(&proof)?)
             .with_context(|| format!("write proof json {}", proof.json_path.display()))?;
         fs::write(&proof.markdown_path, render_proof_markdown(&proof))
             .with_context(|| format!("write proof markdown {}", proof.markdown_path.display()))?;
+        fs::write(&proof.html_path, render_proof_html(&proof))
+            .with_context(|| format!("write proof html {}", proof.html_path.display()))?;
         EventLog::open(self.log_path(session_id))?.append_action(
             session_id,
             Action::Proof {
                 json_path: proof.json_path.clone(),
                 markdown_path: proof.markdown_path.clone(),
+                html_path: proof.html_path.clone(),
             },
             None,
         )?;
@@ -1714,6 +1722,7 @@ fn render_proof_markdown(proof: &ProofBundle) -> String {
     output.push_str(&format!("- Generated: {}\n", proof.generated_at));
     output.push_str(&format!("- Events: {}\n", proof.event_count));
     output.push_str(&format!("- Event log: `{}`\n", proof.log_path.display()));
+    output.push_str(&format!("- HTML: `{}`\n", proof.html_path.display()));
     output.push_str("\n## Commands\n\n");
     if proof.commands_run.is_empty() {
         output.push_str("- none recorded\n");
@@ -1746,6 +1755,165 @@ fn render_proof_markdown(proof: &ProofBundle) -> String {
     output.push_str(proof.screen_tail.trim_end());
     output.push_str("\n```\n");
     output
+}
+
+fn render_proof_html(proof: &ProofBundle) -> String {
+    let commands = if proof.commands_run.is_empty() {
+        "<li>none recorded</li>".to_string()
+    } else {
+        proof
+            .commands_run
+            .iter()
+            .map(|command| format!("<li><code>{}</code></li>", html_escape(command)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let files = if proof.files_changed.is_empty() {
+        "<tr><td colspan=\"2\">none recorded</td></tr>".to_string()
+    } else {
+        proof
+            .files_changed
+            .iter()
+            .map(|change| {
+                format!(
+                    "<tr><td><code>{}</code></td><td>{}</td></tr>",
+                    html_escape(&change.path.display().to_string()),
+                    html_escape(&change.status)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let risks = if proof.risk_flags.is_empty() {
+        "<li>none</li>".to_string()
+    } else {
+        proof
+            .risk_flags
+            .iter()
+            .map(|flag| format!("<li>{}</li>", html_escape(flag)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let latest_git_status = proof
+        .latest_git_status
+        .as_deref()
+        .filter(|status| !status.trim().is_empty())
+        .unwrap_or("clean or unavailable");
+    let git_diff = proof
+        .git_diff
+        .as_deref()
+        .filter(|diff| !diff.trim().is_empty())
+        .unwrap_or("no diff recorded");
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agent-pty proof: {session}</title>
+  <style>
+    :root {{ color-scheme: light dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ margin: 0; background: #f6f7f9; color: #15171a; }}
+    main {{ max-width: 1080px; margin: 0 auto; padding: 32px 20px 48px; }}
+    header {{ border-bottom: 1px solid #d7dce2; margin-bottom: 24px; padding-bottom: 16px; }}
+    h1 {{ font-size: 28px; margin: 0 0 8px; }}
+    h2 {{ font-size: 18px; margin: 28px 0 10px; }}
+    .meta {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 16px; margin: 16px 0 0; }}
+    .meta div {{ background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px; padding: 10px 12px; }}
+    code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    pre {{ background: #111418; color: #eef2f7; border-radius: 6px; overflow: auto; padding: 14px; line-height: 1.45; }}
+    table {{ width: 100%; border-collapse: collapse; background: #ffffff; border: 1px solid #dfe3e8; }}
+    th, td {{ border-bottom: 1px solid #dfe3e8; padding: 8px 10px; text-align: left; vertical-align: top; }}
+    ul, ol {{ background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px; padding: 12px 12px 12px 34px; }}
+    a {{ color: #1457d9; }}
+    @media (prefers-color-scheme: dark) {{
+      body {{ background: #111418; color: #eef2f7; }}
+      header {{ border-color: #333a43; }}
+      .meta div, table, ul, ol {{ background: #171b20; border-color: #333a43; }}
+      th, td {{ border-color: #333a43; }}
+      pre {{ background: #080a0c; }}
+      a {{ color: #80a7ff; }}
+    }}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>agent-pty proof: {session}</h1>
+    <div class="meta">
+      <div><strong>Generated</strong><br>{generated}</div>
+      <div><strong>Events</strong><br>{event_count}</div>
+      <div><strong>Event log</strong><br><code>{log_path}</code></div>
+      <div><strong>JSON</strong><br><code>{json_path}</code></div>
+      <div><strong>Markdown</strong><br><code>{markdown_path}</code></div>
+    </div>
+  </header>
+  <section>
+    <h2>Commands Run</h2>
+    <ol>
+{commands}
+    </ol>
+  </section>
+  <section>
+    <h2>Files Changed</h2>
+    <table>
+      <thead><tr><th>Path</th><th>Status</th></tr></thead>
+      <tbody>
+{files}
+      </tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Risk Flags</h2>
+    <ul>
+{risks}
+    </ul>
+  </section>
+  <section>
+    <h2>Latest Git Status</h2>
+    <pre>{latest_git_status}</pre>
+  </section>
+  <section>
+    <h2>Git Diff</h2>
+    <pre>{git_diff}</pre>
+  </section>
+  <section>
+    <h2>Screen Tail</h2>
+    <pre>{screen_tail}</pre>
+  </section>
+</main>
+</body>
+</html>
+"#,
+        session = html_escape(&proof.session_id),
+        generated = html_escape(&proof.generated_at.to_string()),
+        event_count = proof.event_count,
+        log_path = html_escape(&proof.log_path.display().to_string()),
+        json_path = html_escape(&proof.json_path.display().to_string()),
+        markdown_path = html_escape(&proof.markdown_path.display().to_string()),
+        commands = commands,
+        files = files,
+        risks = risks,
+        latest_git_status = html_escape(latest_git_status),
+        git_diff = html_escape(git_diff),
+        screen_tail = html_escape(proof.screen_tail.trim_end()),
+    )
+}
+
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn process_snapshot(root_pid: u32) -> Option<ProcessSnapshot> {
