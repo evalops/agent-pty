@@ -22,19 +22,16 @@ pub fn handle_http_request(manager: &SessionManager, raw_request: &str) -> Resul
         .next()
         .context("HTTP request missing request line")?;
     if !request_line.starts_with("POST /request ") {
-        return Ok(http_response(
-            404,
-            WireResponse::error("only POST /request is supported"),
-        )?);
+        return http_response(404, WireResponse::error("only POST /request is supported"));
     }
 
     let request = match serde_json::from_str::<Request>(body.trim()) {
         Ok(request) => request,
         Err(error) => {
-            return Ok(http_response(
+            return http_response(
                 400,
                 WireResponse::error(format!("invalid JSON request: {error}")),
-            )?);
+            );
         }
     };
 

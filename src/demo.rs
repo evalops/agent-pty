@@ -11,7 +11,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::session::{SessionConfig, SessionManager, WaitCondition};
+use crate::session::{SessionBackend, SessionConfig, SessionManager, WaitCondition};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DemoOptions {
@@ -62,6 +62,7 @@ pub fn run_demo(options: DemoOptions) -> Result<DemoSummary> {
         env: BTreeMap::new(),
         rows: 24,
         cols: 100,
+        backend: SessionBackend::Pty,
     })?;
 
     let result = run_demo_session(&manager, &session_id);

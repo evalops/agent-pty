@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, process::Command, time::Duration};
 use agent_pty::{
     daemon::{Request, handle_request},
     evidence::{Action, EventKind},
-    session::{SessionConfig, SessionManager, WaitCondition},
+    session::{SessionBackend, SessionConfig, SessionManager, WaitCondition},
 };
 use tempfile::TempDir;
 
@@ -20,6 +20,7 @@ fn manager_persists_session_metadata_and_writes_proof_bundle() {
             env: Default::default(),
             rows: 24,
             cols: 80,
+            backend: SessionBackend::Pty,
         })
         .unwrap();
     manager.send_line("proofy", "printf 'proof-ok\\n'").unwrap();
@@ -101,6 +102,7 @@ fn denied_policy_actions_are_recorded_as_evidence() {
             rows: 24,
             cols: 80,
             env: Default::default(),
+            backend: SessionBackend::Pty,
         },
     )
     .unwrap();
@@ -146,6 +148,7 @@ fn fork_can_create_a_git_worktree_backed_session() {
             env: Default::default(),
             rows: 24,
             cols: 80,
+            backend: SessionBackend::Pty,
         })
         .unwrap();
 

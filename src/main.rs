@@ -19,6 +19,7 @@ use agent_pty::{
     evidence::{Action, EventKind},
     http::serve_http,
     mcp::serve_mcp_stdio,
+    session::SessionBackend,
 };
 
 #[derive(Debug, Parser)]
@@ -97,6 +98,9 @@ enum Command {
         /// Shell to spawn inside the PTY.
         #[arg(long, default_value = "/bin/sh")]
         shell: PathBuf,
+        /// Session runtime backend. Use tmux for daemon-restart reconnect.
+        #[arg(long, value_enum, default_value_t = BackendArg::Pty)]
+        backend: BackendArg,
         #[arg(long, default_value_t = 24)]
         rows: u16,
         #[arg(long, default_value_t = 80)]
@@ -174,6 +178,21 @@ enum OutputFormat {
     Text,
     Markdown,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BackendArg {
+    Pty,
+    Tmux,
+}
+
+impl From<BackendArg> for SessionBackend {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Pty => SessionBackend::Pty,
+            BackendArg::Tmux => SessionBackend::Tmux,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -286,6 +305,7 @@ fn run() -> Result<()> {
             repo,
             name,
             shell,
+            backend,
             rows,
             cols,
         } => {
@@ -298,6 +318,7 @@ fn run() -> Result<()> {
                     rows,
                     cols,
                     env: BTreeMap::new(),
+                    backend: backend.into(),
                 },
             )?;
             print_payload(payload, OutputFormat::Text, false)
@@ -732,10 +753,10 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     if value == "~" {
         return home_dir().unwrap_or(path);
     }
-    if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
     }
     path
 }

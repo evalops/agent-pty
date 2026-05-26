@@ -34,6 +34,7 @@ pub struct SessionConfig {
     pub env: BTreeMap<String, String>,
     pub rows: u16,
     pub cols: u16,
+    pub backend: SessionBackend,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,18 @@ pub struct SessionMetadata {
     pub process_id: Option<u32>,
     pub active: bool,
     pub log_path: PathBuf,
+    #[serde(default)]
+    pub backend: SessionBackend,
+    #[serde(default)]
+    pub tmux_session: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBackend {
+    #[default]
+    Pty,
+    Tmux,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +184,10 @@ impl SessionManager {
     }
 
     pub fn open(&self, config: SessionConfig) -> Result<()> {
+        if config.backend == SessionBackend::Tmux {
+            return self.open_tmux(config);
+        }
+
         if self
             .sessions
             .lock()
@@ -263,12 +280,97 @@ impl SessionManager {
             process_id,
             active: true,
             log_path,
+            backend: SessionBackend::Pty,
+            tmux_session: None,
+        })?;
+        Ok(())
+    }
+
+    fn open_tmux(&self, config: SessionConfig) -> Result<()> {
+        if self
+            .read_index()?
+            .iter()
+            .any(|session| session.id == config.id && session.active)
+        {
+            bail!("session {} already exists", config.id);
+        }
+
+        let tmux_session = safe_filename(&config.id);
+        if tmux_session_exists(&tmux_session) {
+            bail!("tmux session {tmux_session} already exists");
+        }
+
+        let cols = config.cols.to_string();
+        let rows = config.rows.to_string();
+        let mut command = Command::new("tmux");
+        command
+            .args(["new-session", "-d", "-s", &tmux_session, "-c"])
+            .arg(&config.workspace);
+        for (key, value) in &config.env {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
+        let output = command
+            .args(["-x", &cols, "-y", &rows])
+            .arg(&config.shell)
+            .output()
+            .with_context(|| format!("start tmux session {tmux_session}"))?;
+        if !output.status.success() {
+            bail!(
+                "tmux new-session failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let log_path = self.log_path(&config.id);
+        if let Err(error) = start_tmux_pipe(&tmux_session, &self.tmux_transcript_path(&config.id)) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_session])
+                .output();
+            return Err(error);
+        }
+        EventLog::open(log_path.clone())?.append_action(
+            &config.id,
+            Action::Exec {
+                argv: vec![
+                    "tmux".to_string(),
+                    "new-session".to_string(),
+                    "-s".to_string(),
+                    tmux_session.clone(),
+                    config.shell.display().to_string(),
+                ],
+                cwd: config.workspace.clone(),
+            },
+            capture_git(&config.workspace),
+        )?;
+        self.persist_metadata(&SessionMetadata {
+            id: config.id,
+            workspace: config.workspace,
+            shell: config.shell,
+            env: config.env,
+            rows: config.rows,
+            cols: config.cols,
+            started_at: Utc::now(),
+            process_id: None,
+            active: true,
+            log_path,
+            backend: SessionBackend::Tmux,
+            tmux_session: Some(tmux_session),
         })?;
         Ok(())
     }
 
     pub fn send(&self, session_id: &str, bytes: &[u8]) -> Result<()> {
-        let handle = self.handle(session_id)?;
+        let handle = match self.handle(session_id) {
+            Ok(handle) => handle,
+            Err(handle_error) => {
+                if let Some(metadata) = self.metadata(session_id)?
+                    && metadata.backend == SessionBackend::Tmux
+                {
+                    return self.send_tmux(&metadata, bytes);
+                }
+                return Err(handle_error);
+            }
+        };
         {
             let mut writer = handle.writer.lock().expect("session writer lock poisoned");
             writer
@@ -296,7 +398,17 @@ impl SessionManager {
     }
 
     pub fn screen(&self, session_id: &str) -> Result<ScreenSnapshot> {
-        let handle = self.handle(session_id)?;
+        let handle = match self.handle(session_id) {
+            Ok(handle) => handle,
+            Err(handle_error) => {
+                if let Some(metadata) = self.metadata(session_id)?
+                    && metadata.backend == SessionBackend::Tmux
+                {
+                    return self.screen_tmux(&metadata);
+                }
+                return Err(handle_error);
+            }
+        };
         Ok(handle
             .state
             .lock()
@@ -309,7 +421,17 @@ impl SessionManager {
         session_id: &str,
         max_bytes: usize,
     ) -> Result<(usize, String)> {
-        let handle = self.handle(session_id)?;
+        let handle = match self.handle(session_id) {
+            Ok(handle) => handle,
+            Err(handle_error) => {
+                if let Some(metadata) = self.metadata(session_id)?
+                    && metadata.backend == SessionBackend::Tmux
+                {
+                    return self.transcript_snapshot_tmux(&metadata, max_bytes);
+                }
+                return Err(handle_error);
+            }
+        };
         let state = handle.state.lock().expect("session state lock poisoned");
         let len = state.transcript.len();
         let start = len.saturating_sub(max_bytes);
@@ -320,7 +442,17 @@ impl SessionManager {
     }
 
     pub fn transcript_since(&self, session_id: &str, offset: usize) -> Result<(usize, String)> {
-        let handle = self.handle(session_id)?;
+        let handle = match self.handle(session_id) {
+            Ok(handle) => handle,
+            Err(handle_error) => {
+                if let Some(metadata) = self.metadata(session_id)?
+                    && metadata.backend == SessionBackend::Tmux
+                {
+                    return self.transcript_since_tmux(&metadata, offset);
+                }
+                return Err(handle_error);
+            }
+        };
         let state = handle.state.lock().expect("session state lock poisoned");
         let len = state.transcript.len();
         if offset >= len {
@@ -338,7 +470,17 @@ impl SessionManager {
         condition: WaitCondition,
         timeout: Duration,
     ) -> Result<SessionObservation> {
-        let handle = self.handle(session_id)?;
+        let handle = match self.handle(session_id) {
+            Ok(handle) => handle,
+            Err(handle_error) => {
+                if let Some(metadata) = self.metadata(session_id)?
+                    && metadata.backend == SessionBackend::Tmux
+                {
+                    return self.wait_tmux(session_id, &metadata, condition, timeout);
+                }
+                return Err(handle_error);
+            }
+        };
         handle.log.append_action(
             session_id,
             Action::WaitFor {
@@ -373,7 +515,17 @@ impl SessionManager {
     }
 
     pub fn kill(&self, session_id: &str) -> Result<()> {
-        let handle = self.handle(session_id)?;
+        let handle = match self.handle(session_id) {
+            Ok(handle) => handle,
+            Err(handle_error) => {
+                if let Some(metadata) = self.metadata(session_id)?
+                    && metadata.backend == SessionBackend::Tmux
+                {
+                    return self.kill_tmux(&metadata);
+                }
+                return Err(handle_error);
+            }
+        };
         handle
             .child
             .lock()
@@ -391,7 +543,22 @@ impl SessionManager {
     }
 
     pub fn record_attach(&self, session_id: &str) -> Result<()> {
-        let handle = self.handle(session_id)?;
+        let handle = match self.handle(session_id) {
+            Ok(handle) => handle,
+            Err(handle_error) => {
+                if let Some(metadata) = self.metadata(session_id)?
+                    && metadata.backend == SessionBackend::Tmux
+                {
+                    EventLog::open(self.log_path(session_id))?.append_action(
+                        session_id,
+                        Action::AttachHuman,
+                        capture_git(&metadata.workspace),
+                    )?;
+                    return Ok(());
+                }
+                return Err(handle_error);
+            }
+        };
         handle.log.append_action(
             session_id,
             Action::AttachHuman,
@@ -419,7 +586,13 @@ impl SessionManager {
             .read_index()?
             .into_iter()
             .map(|mut metadata| {
-                metadata.active = false;
+                metadata.active = match metadata.backend {
+                    SessionBackend::Pty => false,
+                    SessionBackend::Tmux => metadata
+                        .tmux_session
+                        .as_deref()
+                        .is_some_and(tmux_session_exists),
+                };
                 (metadata.id.clone(), metadata)
             })
             .collect::<BTreeMap<_, _>>();
@@ -437,12 +610,17 @@ impl SessionManager {
     }
 
     pub fn record_policy_denial(&self, session_id: &str, command: &str, rule: &str) -> Result<()> {
-        let git_snapshot = self
+        let git_snapshot = if let Some(handle) = self
             .sessions
             .lock()
             .expect("session registry lock poisoned")
             .get(session_id)
-            .and_then(|handle| capture_git(&handle.config.workspace));
+        {
+            capture_git(&handle.config.workspace)
+        } else {
+            self.metadata(session_id)?
+                .and_then(|metadata| capture_git(&metadata.workspace))
+        };
         EventLog::open(self.log_path(session_id))?.append_action(
             session_id,
             Action::PolicyDenied {
@@ -599,6 +777,195 @@ impl SessionManager {
         &self.trace_path
     }
 
+    fn send_tmux(&self, metadata: &SessionMetadata, bytes: &[u8]) -> Result<()> {
+        let session = metadata
+            .tmux_session
+            .as_deref()
+            .with_context(|| format!("session {} missing tmux session name", metadata.id))?;
+        ensure_tmux_session(session)?;
+        self.ensure_tmux_pipe(metadata)?;
+        send_tmux_bytes(session, bytes)?;
+        EventLog::open(self.log_path(&metadata.id))?.append_action(
+            &metadata.id,
+            Action::SendKeys {
+                bytes: bytes.to_vec(),
+            },
+            capture_git(&metadata.workspace),
+        )?;
+        Ok(())
+    }
+
+    fn transcript_snapshot_tmux(
+        &self,
+        metadata: &SessionMetadata,
+        max_bytes: usize,
+    ) -> Result<(usize, String)> {
+        self.ensure_tmux_pipe(metadata)?;
+        let text = self.tmux_transcript_text(&metadata.id)?;
+        let len = text.len();
+        if len == 0 {
+            let screen = self.screen_tmux(metadata)?.text;
+            let start = screen.len().saturating_sub(max_bytes);
+            return Ok((0, slice_from_boundary(&screen, start).to_string()));
+        }
+        let start = len.saturating_sub(max_bytes);
+        Ok((len, slice_from_boundary(&text, start).to_string()))
+    }
+
+    fn transcript_since_tmux(
+        &self,
+        metadata: &SessionMetadata,
+        offset: usize,
+    ) -> Result<(usize, String)> {
+        self.ensure_tmux_pipe(metadata)?;
+        let text = self.tmux_transcript_text(&metadata.id)?;
+        let len = text.len();
+        if offset >= len {
+            return Ok((len, String::new()));
+        }
+        Ok((len, slice_from_boundary(&text, offset).to_string()))
+    }
+
+    fn screen_tmux(&self, metadata: &SessionMetadata) -> Result<ScreenSnapshot> {
+        let session = metadata
+            .tmux_session
+            .as_deref()
+            .with_context(|| format!("session {} missing tmux session name", metadata.id))?;
+        ensure_tmux_session(session)?;
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", session, "-S", "-3000"])
+            .output()
+            .with_context(|| format!("capture tmux session {session}"))?;
+        if !output.status.success() {
+            bail!(
+                "tmux capture-pane failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        Ok(ScreenSnapshot {
+            rows: metadata.rows,
+            cols: metadata.cols,
+            spans: spans_for_screen(&text),
+            text,
+        })
+    }
+
+    fn wait_tmux(
+        &self,
+        session_id: &str,
+        metadata: &SessionMetadata,
+        condition: WaitCondition,
+        timeout: Duration,
+    ) -> Result<SessionObservation> {
+        let log = EventLog::open(self.log_path(session_id))?;
+        log.append_action(
+            session_id,
+            Action::WaitFor {
+                predicate: condition.to_predicate(),
+                timeout,
+            },
+            capture_git(&metadata.workspace),
+        )?;
+        let matcher = condition.matcher()?;
+        let deadline = Instant::now() + timeout;
+        let mut last_text = String::new();
+        let mut last_change_at = Instant::now();
+
+        loop {
+            let mut observation = self.observation_from_tmux(metadata)?;
+            if observation.screen.text != last_text {
+                last_text = observation.screen.text.clone();
+                last_change_at = Instant::now();
+            }
+            if matcher.matches_tmux(&observation, last_change_at) {
+                log.append_observation(session_id, observation.to_evidence())?;
+                return Ok(observation);
+            }
+
+            if Instant::now() >= deadline {
+                observation = self.observation_from_tmux(metadata)?;
+                log.append_observation(session_id, observation.to_evidence())?;
+                bail!("timed out waiting for {condition:?} in session {session_id}");
+            }
+
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn kill_tmux(&self, metadata: &SessionMetadata) -> Result<()> {
+        let session = metadata
+            .tmux_session
+            .as_deref()
+            .with_context(|| format!("session {} missing tmux session name", metadata.id))?;
+        if tmux_session_exists(session) {
+            let output = Command::new("tmux")
+                .args(["kill-session", "-t", session])
+                .output()
+                .with_context(|| format!("kill tmux session {session}"))?;
+            if !output.status.success() {
+                bail!(
+                    "tmux kill-session failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        EventLog::open(self.log_path(&metadata.id))?.append_action(
+            &metadata.id,
+            Action::Kill {
+                signal: "kill".to_string(),
+            },
+            capture_git(&metadata.workspace),
+        )?;
+        let mut updated = metadata.clone();
+        updated.active = false;
+        self.persist_metadata(&updated)?;
+        Ok(())
+    }
+
+    fn observation_from_tmux(&self, metadata: &SessionMetadata) -> Result<SessionObservation> {
+        let screen = self.screen_tmux(metadata)?;
+        let stdout_tail = tail_chars(&screen.text, 12_000);
+        let git_snapshot = capture_git(&metadata.workspace);
+        let files_changed = git_snapshot
+            .as_ref()
+            .map(files_changed_from_git)
+            .unwrap_or_default();
+        Ok(SessionObservation {
+            screen,
+            stdout_tail,
+            stderr_tail: String::new(),
+            exit_status: None,
+            files_changed,
+            git_snapshot,
+            process_snapshot: metadata
+                .tmux_session
+                .as_deref()
+                .and_then(tmux_root_pid)
+                .and_then(process_snapshot),
+        })
+    }
+
+    fn ensure_tmux_pipe(&self, metadata: &SessionMetadata) -> Result<()> {
+        let session = metadata
+            .tmux_session
+            .as_deref()
+            .with_context(|| format!("session {} missing tmux session name", metadata.id))?;
+        ensure_tmux_session(session)?;
+        start_tmux_pipe(session, &self.tmux_transcript_path(&metadata.id))
+    }
+
+    fn tmux_transcript_text(&self, session_id: &str) -> Result<String> {
+        let path = self.tmux_transcript_path(session_id);
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(error) => {
+                Err(error).with_context(|| format!("read tmux transcript {}", path.display()))
+            }
+        }
+    }
+
     fn observation_from(&self, handle: &SessionHandle) -> SessionObservation {
         let state = handle.state.lock().expect("session state lock poisoned");
         let screen = state.screen_snapshot();
@@ -664,6 +1031,11 @@ impl SessionManager {
             .join(format!("{}.jsonl", safe_filename(session_id)))
     }
 
+    fn tmux_transcript_path(&self, session_id: &str) -> PathBuf {
+        self.log_dir
+            .join(format!("{}.tmux.log", safe_filename(session_id)))
+    }
+
     fn metadata_for_handle(&self, handle: &SessionHandle) -> SessionMetadata {
         SessionMetadata {
             id: handle.config.id.clone(),
@@ -676,7 +1048,16 @@ impl SessionManager {
             process_id: handle.process_id,
             active: true,
             log_path: self.log_path(&handle.config.id),
+            backend: SessionBackend::Pty,
+            tmux_session: None,
         }
+    }
+
+    fn metadata(&self, session_id: &str) -> Result<Option<SessionMetadata>> {
+        Ok(self
+            .read_index()?
+            .into_iter()
+            .find(|metadata| metadata.id == session_id))
     }
 
     fn read_index(&self) -> Result<Vec<SessionMetadata>> {
@@ -829,6 +1210,22 @@ impl WaitMatcher {
                     .elapsed()
                     >= *quiet_for
             }
+        }
+    }
+
+    fn matches_tmux(&self, observation: &SessionObservation, last_change_at: Instant) -> bool {
+        match self {
+            WaitMatcher::Regex(regex) => {
+                regex.is_match(&observation.screen.text) || regex.is_match(&observation.stdout_tail)
+            }
+            WaitMatcher::Prompt => observation
+                .screen
+                .text
+                .lines()
+                .last()
+                .is_some_and(looks_like_prompt),
+            WaitMatcher::Exit => false,
+            WaitMatcher::Idle { quiet_for } => last_change_at.elapsed() >= *quiet_for,
         }
     }
 }
@@ -1096,6 +1493,84 @@ fn process_snapshot(root_pid: u32) -> Option<ProcessSnapshot> {
             processes,
         })
     }
+}
+
+fn tmux_session_exists(session: &str) -> bool {
+    Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn ensure_tmux_session(session: &str) -> Result<()> {
+    if tmux_session_exists(session) {
+        Ok(())
+    } else {
+        bail!("tmux session {session} is not running")
+    }
+}
+
+fn start_tmux_pipe(session: &str, transcript_path: &Path) -> Result<()> {
+    let command = format!("cat >> {}", shell_quote(&transcript_path.to_string_lossy()));
+    let output = Command::new("tmux")
+        .args(["pipe-pane", "-o", "-t", session])
+        .arg(command)
+        .output()
+        .with_context(|| format!("start tmux transcript pipe for session {session}"))?;
+    if !output.status.success() {
+        bail!(
+            "tmux pipe-pane failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn send_tmux_bytes(session: &str, bytes: &[u8]) -> Result<()> {
+    let text = String::from_utf8_lossy(bytes);
+    let parts = text.split('\n').collect::<Vec<_>>();
+    for (index, part) in parts.iter().enumerate() {
+        if !part.is_empty() {
+            let output = Command::new("tmux")
+                .args(["send-keys", "-t", session, "-l", part])
+                .output()
+                .with_context(|| format!("send literal keys to tmux session {session}"))?;
+            if !output.status.success() {
+                bail!(
+                    "tmux send-keys failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+        if index < parts.len().saturating_sub(1) {
+            let output = Command::new("tmux")
+                .args(["send-keys", "-t", session, "Enter"])
+                .output()
+                .with_context(|| format!("send Enter to tmux session {session}"))?;
+            if !output.status.success() {
+                bail!(
+                    "tmux send-keys Enter failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tmux_root_pid(session: &str) -> Option<u32> {
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "-t", session, "#{pane_pid}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn parse_process_info(line: &str) -> Option<ProcessInfo> {

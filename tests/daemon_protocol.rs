@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use agent_pty::{
     daemon::{Request, ResponsePayload, handle_request},
-    session::SessionManager,
+    session::{SessionBackend, SessionManager},
 };
 use tempfile::TempDir;
 
@@ -20,6 +20,7 @@ fn daemon_request_flow_controls_session_and_replays_events() {
             rows: 24,
             cols: 80,
             env: Default::default(),
+            backend: SessionBackend::Pty,
         },
     )
     .unwrap();
@@ -94,6 +95,7 @@ fn daemon_rejects_dangerous_commands_before_they_reach_the_pty() {
             rows: 24,
             cols: 80,
             env: Default::default(),
+            backend: SessionBackend::Pty,
         },
     )
     .unwrap();

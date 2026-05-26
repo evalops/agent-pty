@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{
     daemon::{Request, ResponsePayload, handle_request},
-    session::SessionManager,
+    session::{SessionBackend, SessionManager},
 };
 
 pub fn handle_mcp_message(manager: &SessionManager, message: Value) -> Result<Value> {
@@ -97,6 +97,7 @@ fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -> Result<R
             rows: u16_arg(&arguments, "rows", 24)?,
             cols: u16_arg(&arguments, "cols", 80)?,
             env: map_arg(&arguments, "env")?,
+            backend: backend_arg(&arguments),
         },
         "terminal.send" => Request::Send {
             id: string_arg(&arguments, "id")?,
@@ -189,6 +190,13 @@ fn bool_arg(arguments: &Value, key: &str, default: bool) -> bool {
         .get(key)
         .and_then(Value::as_bool)
         .unwrap_or(default)
+}
+
+fn backend_arg(arguments: &Value) -> SessionBackend {
+    match arguments.get("backend").and_then(Value::as_str) {
+        Some("tmux") => SessionBackend::Tmux,
+        _ => SessionBackend::Pty,
+    }
 }
 
 fn map_arg(arguments: &Value, key: &str) -> Result<BTreeMap<String, String>> {
