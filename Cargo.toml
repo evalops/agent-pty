@@ -2,6 +2,25 @@
 name = "agent-pty"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Agent terminal substrate with persistent PTYs, semantic screens, policy gates, and proof artifacts"
+repository = "https://github.com/evalops/agent-pty"
+homepage = "https://github.com/evalops/agent-pty"
+readme = "README.md"
+keywords = ["pty", "terminal", "agents", "evidence", "tmux"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "docs/**",
+    "examples/**",
+    "fixtures/**",
+    "scripts/**",
+    "src/**",
+    "tests/**",
+]
 
 [dependencies]
 anyhow = "1.0"

@@ -17,6 +17,9 @@ Install from the public repo:
 cargo install --git https://github.com/evalops/agent-pty
 ```
 
+See [docs/INSTALL.md](docs/INSTALL.md) for requirements, source builds, and
+local verification.
+
 Run the self-contained demo first. It does not require a daemon:
 
 ```bash
