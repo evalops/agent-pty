@@ -27,6 +27,7 @@ fn tmux_black_box_harness_exercises_agent_pty_end_to_end() {
     assert!(report.contains("MCP: ok"));
     assert!(report.contains("tmux capture: ok"));
     assert!(report.contains("policy denial: ok"));
+    assert!(report.contains("policy approval: ok"));
     assert!(report.contains("human attach: ok"));
     assert!(report.contains("tmux reconnect: ok"));
     assert!(report.contains("daemon restart replay: ok"));

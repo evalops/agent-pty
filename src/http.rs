@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::{
     daemon::{Request, WireResponse, handle_request},
+    policy::ActionPolicy,
     session::SessionManager,
 };
 
@@ -42,13 +43,21 @@ pub fn handle_http_request(manager: &SessionManager, raw_request: &str) -> Resul
     Ok(response)
 }
 
-pub fn serve_http<A: ToSocketAddrs>(addr: A, log_dir: impl Into<PathBuf>) -> Result<()> {
+pub fn serve_http<A: ToSocketAddrs>(
+    addr: A,
+    log_dir: impl Into<PathBuf>,
+    policy: ActionPolicy,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).context("bind HTTP listener")?;
-    serve_http_listener(listener, log_dir)
+    serve_http_listener(listener, log_dir, policy)
 }
 
-pub fn serve_http_listener(listener: TcpListener, log_dir: impl Into<PathBuf>) -> Result<()> {
-    let manager = Arc::new(SessionManager::new(log_dir)?);
+pub fn serve_http_listener(
+    listener: TcpListener,
+    log_dir: impl Into<PathBuf>,
+    policy: ActionPolicy,
+) -> Result<()> {
+    let manager = Arc::new(SessionManager::new_with_policy(log_dir, policy)?);
     for stream in listener.incoming() {
         let mut stream = stream.context("accept HTTP connection")?;
         let manager = Arc::clone(&manager);

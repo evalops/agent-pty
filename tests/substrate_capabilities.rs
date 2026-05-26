@@ -113,6 +113,7 @@ fn denied_policy_actions_are_recorded_as_evidence() {
             id: "policy-audit".to_string(),
             text: "terraform apply".to_string(),
             enter: true,
+            approval: None,
         },
     )
     .unwrap_err()

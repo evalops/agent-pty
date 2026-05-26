@@ -14,9 +14,13 @@ use chrono::{DateTime, Utc};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::evidence::{
-    Action, EventLog, EvidenceEvent, FileChange, GitSnapshot, Observation, Predicate,
+use crate::{
+    evidence::{Action, EventLog, EvidenceEvent, FileChange, GitSnapshot, Observation, Predicate},
+    policy::{
+        ActionPolicy, PolicyAction, PolicyApprovalGrant, PolicyApprovalRecord, approval_expiry,
+    },
 };
 
 static URL_RE: LazyLock<Regex> =
@@ -161,13 +165,20 @@ pub enum SpanKind {
 pub struct SessionManager {
     log_dir: PathBuf,
     index_path: PathBuf,
+    approvals_path: PathBuf,
     proof_dir: PathBuf,
     trace_path: PathBuf,
+    policy: ActionPolicy,
+    approval_lock: Mutex<()>,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
 }
 
 impl SessionManager {
     pub fn new(log_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::new_with_policy(log_dir, ActionPolicy::default())
+    }
+
+    pub fn new_with_policy(log_dir: impl Into<PathBuf>, policy: ActionPolicy) -> Result<Self> {
         let log_dir = log_dir.into();
         std::fs::create_dir_all(&log_dir)
             .with_context(|| format!("create session log dir {}", log_dir.display()))?;
@@ -176,9 +187,12 @@ impl SessionManager {
             .with_context(|| format!("create proof dir {}", proof_dir.display()))?;
         Ok(Self {
             index_path: log_dir.join("sessions.json"),
+            approvals_path: log_dir.join("policy-approvals.json"),
             trace_path: log_dir.join("traces.jsonl"),
             proof_dir,
             log_dir,
+            policy,
+            approval_lock: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -610,26 +624,121 @@ impl SessionManager {
     }
 
     pub fn record_policy_denial(&self, session_id: &str, command: &str, rule: &str) -> Result<()> {
-        let git_snapshot = if let Some(handle) = self
-            .sessions
-            .lock()
-            .expect("session registry lock poisoned")
-            .get(session_id)
-        {
-            capture_git(&handle.config.workspace)
-        } else {
-            self.metadata(session_id)?
-                .and_then(|metadata| capture_git(&metadata.workspace))
-        };
         EventLog::open(self.log_path(session_id))?.append_action(
             session_id,
             Action::PolicyDenied {
                 command: command.to_string(),
                 rule: rule.to_string(),
             },
-            git_snapshot,
+            self.git_snapshot_for_session(session_id)?,
         )?;
         Ok(())
+    }
+
+    pub fn authorize_action_policy(
+        &self,
+        session_id: &str,
+        command: &str,
+        approval: Option<&str>,
+    ) -> Result<()> {
+        let Some(policy_match) = self.policy.evaluate(command) else {
+            return Ok(());
+        };
+
+        match policy_match.action {
+            PolicyAction::Allow => Ok(()),
+            PolicyAction::Deny => {
+                self.record_policy_denial(session_id, command, &policy_match.label)?;
+                bail!("{} is denied by policy", policy_match.label);
+            }
+            PolicyAction::RequireApproval => {
+                if let Some(token) = approval
+                    && let Some(approval_id) = self.consume_policy_approval(
+                        session_id,
+                        command,
+                        &policy_match.label,
+                        token,
+                    )?
+                {
+                    self.record_policy_approved(
+                        session_id,
+                        command,
+                        &policy_match.label,
+                        &approval_id,
+                    )?;
+                    return Ok(());
+                }
+
+                self.record_policy_denial(session_id, command, &policy_match.label)?;
+                bail!(
+                    "{} requires approval before it can be sent to the PTY",
+                    policy_match.label
+                );
+            }
+        }
+    }
+
+    pub fn create_policy_approval(
+        &self,
+        session_id: &str,
+        command: &str,
+        rule: Option<&str>,
+        ttl: Duration,
+    ) -> Result<PolicyApprovalGrant> {
+        let policy_match = self
+            .policy
+            .evaluate(command)
+            .with_context(|| "command does not match a policy rule requiring approval")?;
+        if policy_match.action == PolicyAction::Deny {
+            bail!(
+                "{} is denied by policy and cannot be approved",
+                policy_match.label
+            );
+        }
+        if let Some(rule) = rule
+            && rule != policy_match.label
+        {
+            bail!(
+                "approval rule {rule:?} does not match command policy {:?}",
+                policy_match.label
+            );
+        }
+
+        let now = Utc::now();
+        let record = PolicyApprovalRecord {
+            id: Uuid::new_v4().to_string(),
+            token: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            command: command.to_string(),
+            rule: policy_match.label,
+            created_at: now,
+            expires_at: approval_expiry(ttl),
+            used_at: None,
+        };
+        let grant = record.grant();
+
+        {
+            let _guard = self
+                .approval_lock
+                .lock()
+                .expect("policy approval lock poisoned");
+            let mut approvals = self.read_policy_approvals()?;
+            approvals.push(record);
+            self.write_policy_approvals(&approvals)?;
+        }
+
+        EventLog::open(self.log_path(session_id))?.append_action(
+            session_id,
+            Action::PolicyApprovalCreated {
+                command: command.to_string(),
+                rule: grant.rule.clone(),
+                approval_id: grant.id.clone(),
+                expires_at: grant.expires_at,
+            },
+            self.git_snapshot_for_session(session_id)?,
+        )?;
+
+        Ok(grant)
     }
 
     pub fn fork(
@@ -699,6 +808,9 @@ impl SessionManager {
                     }
                     Action::PolicyDenied { command, rule } => {
                         risk_flags.insert(format!("blocked {rule}: {command}"));
+                    }
+                    Action::PolicyApproved { command, rule, .. } => {
+                        risk_flags.insert(format!("approved {rule}: {command}"));
                     }
                     _ => {}
                 },
@@ -964,6 +1076,78 @@ impl SessionManager {
                 Err(error).with_context(|| format!("read tmux transcript {}", path.display()))
             }
         }
+    }
+
+    fn consume_policy_approval(
+        &self,
+        session_id: &str,
+        command: &str,
+        rule: &str,
+        token: &str,
+    ) -> Result<Option<String>> {
+        let _guard = self
+            .approval_lock
+            .lock()
+            .expect("policy approval lock poisoned");
+        let mut approvals = self.read_policy_approvals()?;
+        let now = Utc::now();
+        for approval in &mut approvals {
+            if approval.is_valid_for(session_id, command, rule, token, now) {
+                approval.used_at = Some(now);
+                let approval_id = approval.id.clone();
+                self.write_policy_approvals(&approvals)?;
+                return Ok(Some(approval_id));
+            }
+        }
+        Ok(None)
+    }
+
+    fn record_policy_approved(
+        &self,
+        session_id: &str,
+        command: &str,
+        rule: &str,
+        approval_id: &str,
+    ) -> Result<()> {
+        EventLog::open(self.log_path(session_id))?.append_action(
+            session_id,
+            Action::PolicyApproved {
+                command: command.to_string(),
+                rule: rule.to_string(),
+                approval_id: approval_id.to_string(),
+            },
+            self.git_snapshot_for_session(session_id)?,
+        )?;
+        Ok(())
+    }
+
+    fn git_snapshot_for_session(&self, session_id: &str) -> Result<Option<GitSnapshot>> {
+        if let Some(handle) = self
+            .sessions
+            .lock()
+            .expect("session registry lock poisoned")
+            .get(session_id)
+        {
+            return Ok(capture_git(&handle.config.workspace));
+        }
+        Ok(self
+            .metadata(session_id)?
+            .and_then(|metadata| capture_git(&metadata.workspace)))
+    }
+
+    fn read_policy_approvals(&self) -> Result<Vec<PolicyApprovalRecord>> {
+        if !self.approvals_path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&self.approvals_path)
+            .with_context(|| format!("read policy approvals {}", self.approvals_path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse policy approvals {}", self.approvals_path.display()))
+    }
+
+    fn write_policy_approvals(&self, approvals: &[PolicyApprovalRecord]) -> Result<()> {
+        fs::write(&self.approvals_path, serde_json::to_vec_pretty(approvals)?)
+            .with_context(|| format!("write policy approvals {}", self.approvals_path.display()))
     }
 
     fn observation_from(&self, handle: &SessionHandle) -> SessionObservation {
