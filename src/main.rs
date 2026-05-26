@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use agent_pty::{
     daemon::{Request, ResponsePayload, parse_duration, request_unix, serve_unix},
+    demo::{DemoOptions, run_demo},
     evidence::{Action, EventKind},
     http::serve_http,
     mcp::serve_mcp_stdio,
@@ -23,25 +24,47 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start the Unix-socket daemon for persistent terminal sessions.
     Serve {
         #[arg(long, default_value = "~/.agent-pty/runs")]
         log_dir: PathBuf,
     },
+    /// Start the HTTP/JSON daemon.
     ServeHttp {
         #[arg(long, default_value = "127.0.0.1:4319")]
         addr: String,
         #[arg(long, default_value = "~/.agent-pty/runs")]
         log_dir: PathBuf,
     },
+    /// Serve MCP-compatible terminal tools over stdio JSON-RPC.
     McpStdio {
         #[arg(long, default_value = "~/.agent-pty/runs")]
         log_dir: PathBuf,
     },
+    /// Run a self-contained five-minute demo and emit proof artifacts.
+    Demo {
+        /// Directory where demo runs and artifacts are written.
+        #[arg(long, default_value = "~/.agent-pty/demos")]
+        root: PathBuf,
+        /// Session name to use in the demo artifacts.
+        #[arg(long, default_value = "demo")]
+        name: String,
+        /// Shell used for the demo PTY session.
+        #[arg(long, default_value = "/bin/sh")]
+        shell: PathBuf,
+        /// Print a machine-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a persistent terminal session in a repository.
     New {
+        /// Workspace/repository path for the session.
         #[arg(long)]
         repo: PathBuf,
+        /// Stable session name.
         #[arg(long)]
         name: String,
+        /// Shell to spawn inside the PTY.
         #[arg(long, default_value = "/bin/sh")]
         shell: PathBuf,
         #[arg(long, default_value_t = 24)]
@@ -49,41 +72,49 @@ enum Command {
         #[arg(long, default_value_t = 80)]
         cols: u16,
     },
+    /// Send text or keys to a session.
     Send {
         name: String,
         text: String,
+        /// Send bytes without appending Enter.
         #[arg(long)]
         no_enter: bool,
     },
+    /// Read the current semantic screen snapshot.
     Screen {
         name: String,
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },
+    /// Wait until a predicate is true.
     Wait {
         name: String,
+        /// Predicate: literal text, regex:<pattern>, prompt, exit, or idle:<duration>.
         #[arg(long)]
         until: String,
         #[arg(long, default_value = "30s")]
         timeout: String,
     },
-    Kill {
-        name: String,
-    },
+    /// Kill a running session.
+    Kill { name: String },
+    /// Replay append-only evidence events.
     Replay {
         name: String,
         #[arg(long)]
         json: bool,
     },
+    /// List known sessions.
     List {
         #[arg(long)]
         json: bool,
     },
+    /// Write a JSON and Markdown proof bundle for a session.
     Proof {
         name: String,
         #[arg(long)]
         json: bool,
     },
+    /// Fork a session, optionally with a git worktree-backed workspace.
     Fork {
         name: String,
         #[arg(long)]
@@ -91,6 +122,7 @@ enum Command {
         #[arg(long)]
         copy_worktree: bool,
     },
+    /// Print the OTEL-style JSONL trace log path.
     TracePath,
 }
 
@@ -127,6 +159,28 @@ fn run() -> Result<()> {
             serve_http(addr, log_dir)
         }
         Command::McpStdio { log_dir } => serve_mcp_stdio(expand_tilde(log_dir)),
+        Command::Demo {
+            root,
+            name,
+            shell,
+            json,
+        } => {
+            let summary = run_demo(DemoOptions {
+                root: expand_tilde(root),
+                name,
+                shell: expand_tilde(shell),
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("agent-pty demo complete");
+                println!("workspace: {}", summary.workspace.display());
+                println!("report: {}", summary.report_path.display());
+                println!("proof: {}", summary.proof_markdown_path.display());
+                println!("event log: {}", summary.event_log_path.display());
+            }
+            Ok(())
+        }
         Command::New {
             repo,
             name,
