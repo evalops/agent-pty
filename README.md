@@ -53,6 +53,7 @@ agent-pty new --repo "$PWD" --name first-run
 agent-pty send first-run "printf 'hello from agent-pty\n'"
 agent-pty wait first-run --until "hello from agent-pty"
 agent-pty screen first-run --format markdown
+agent-pty attach first-run --read-only --timeout 2s
 agent-pty proof first-run
 agent-pty kill first-run
 agent-pty stop
@@ -75,6 +76,7 @@ agent-pty stop
 - Initial policy gate with audited denial events.
 - Unix-socket JSON daemon.
 - Daemon lifecycle diagnostics with `doctor`, `status`, and `stop`.
+- Human attach over the Unix socket with live output and optional stdin control.
 - HTTP/JSON request surface.
 - MCP-compatible stdio JSON-RPC tool surface.
 - OTEL-style JSONL trace events for daemon requests.
@@ -93,6 +95,7 @@ agent-pty mcp-stdio
 
 agent-pty new --repo ~/src/evalops/platform --name codex-1
 agent-pty send codex-1 "cargo test"
+agent-pty attach codex-1
 agent-pty screen codex-1 --format markdown
 agent-pty wait codex-1 --until "finished in"
 agent-pty wait codex-1 --until "idle:2s"
@@ -106,12 +109,15 @@ agent-pty kill codex-1
 
 ## Unix Socket Protocol
 
-The daemon accepts newline-delimited JSON on the configured Unix socket. Each
-connection carries one request and receives one response.
+The daemon accepts newline-delimited JSON on the configured Unix socket. Most
+connections carry one request and receive one response. `attach` is the
+exception: after the JSON handshake, the socket switches into a bidirectional
+terminal stream.
 
 ```json
 {"op":"new","id":"codex-1","repo":"/repo","shell":"/bin/sh","rows":24,"cols":80,"env":{}}
 {"op":"send","id":"codex-1","text":"cargo test","enter":true}
+{"op":"attach","id":"codex-1","read_only":false,"history_bytes":12000}
 {"op":"wait","id":"codex-1","until":"regex:finished in","timeout_ms":30000}
 {"op":"screen","id":"codex-1"}
 {"op":"list"}
@@ -144,6 +150,33 @@ agent-pty stop
 `status --json` succeeds even when the daemon is unreachable, returning
 `running: false` with the connection diagnostic in `error`. That makes it safe
 for scripts and agents to call without turning "not running" into an exception.
+
+## Human Attach
+
+Attach streams the session transcript and live output into the current terminal.
+By default, stdin is forwarded into the PTY, so a human can answer prompts or
+interrupt a process directly:
+
+```bash
+agent-pty attach codex-1
+```
+
+For observation-only use, pass `--read-only`:
+
+```bash
+agent-pty attach codex-1 --read-only
+```
+
+For smoke tests and scripts, `--timeout` exits automatically:
+
+```bash
+agent-pty attach codex-1 --read-only --timeout 2s
+printf 'yes\n' | agent-pty attach codex-1 --timeout 1s
+```
+
+Attach uses a streaming Unix-socket handshake, not the one-request/one-response
+JSON protocol. Each attach is recorded as evidence, and any bytes typed through
+the attach channel are logged as normal `send_keys` actions.
 
 ## HTTP Transport
 

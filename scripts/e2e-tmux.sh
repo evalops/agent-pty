@@ -158,6 +158,7 @@ write_report() {
     echo "- tmux capture: ok"
     echo "- policy denial: ok"
     echo "- prompt interaction: ok"
+    echo "- human attach: ok"
     echo "- REPL interaction: ok"
     echo "- long-running logs: ok"
     echo "- daemon restart replay: ok"
@@ -187,6 +188,16 @@ must prompt_wait_ready "$BIN" --socket "$SOCKET" wait base --until "ready?" --ti
 must prompt_answer "$BIN" --socket "$SOCKET" send base "yes"
 must prompt_wait_answer "$BIN" --socket "$SOCKET" wait base --until "answer=yes" --timeout 10s
 record prompt
+
+must attach_read "$BIN" --socket "$SOCKET" attach base --read-only --timeout 250ms
+assert_contains "$ARTIFACTS/attach_read.out" "answer=yes"
+must attach_prompt "$BIN" --socket "$SOCKET" send base 'printf "attach-ready> "; read line; printf "attach-got=%s\n" "$line"'
+must attach_wait_ready "$BIN" --socket "$SOCKET" wait base --until "attach-ready>" --timeout 10s
+must attach_write sh -c 'printf "from-attach\n" | "$1" --socket "$2" attach base --timeout 1s' sh "$BIN" "$SOCKET"
+assert_contains "$ARTIFACTS/attach_write.out" "attach-got=from-attach"
+must attach_replay "$BIN" --socket "$SOCKET" replay base
+assert_contains "$ARTIFACTS/attach_replay.out" "attach human"
+record attach
 
 must repl_start "$BIN" --socket "$SOCKET" send base "python3 -q"
 must repl_wait_prompt "$BIN" --socket "$SOCKET" wait base --until ">>>" --timeout 10s
@@ -321,6 +332,7 @@ grep -F "agent-pty-e2e-complete" "$ARTIFACTS/tmux-driver-pane.txt" >/dev/null
 grep -F "Unix CLI: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "HTTP: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "MCP: ok" "$ARTIFACTS/report.md" >/dev/null
+grep -F "human attach: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "daemon restart replay: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "fork comparison: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "tests passed" "$ARTIFACTS/proofs/fix-a.proof.md" >/dev/null

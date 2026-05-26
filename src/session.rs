@@ -304,6 +304,34 @@ impl SessionManager {
             .screen_snapshot())
     }
 
+    pub fn transcript_snapshot(
+        &self,
+        session_id: &str,
+        max_bytes: usize,
+    ) -> Result<(usize, String)> {
+        let handle = self.handle(session_id)?;
+        let state = handle.state.lock().expect("session state lock poisoned");
+        let len = state.transcript.len();
+        let start = len.saturating_sub(max_bytes);
+        Ok((
+            len,
+            slice_from_boundary(&state.transcript, start).to_string(),
+        ))
+    }
+
+    pub fn transcript_since(&self, session_id: &str, offset: usize) -> Result<(usize, String)> {
+        let handle = self.handle(session_id)?;
+        let state = handle.state.lock().expect("session state lock poisoned");
+        let len = state.transcript.len();
+        if offset >= len {
+            return Ok((len, String::new()));
+        }
+        Ok((
+            len,
+            slice_from_boundary(&state.transcript, offset).to_string(),
+        ))
+    }
+
     pub fn wait(
         &self,
         session_id: &str,
@@ -357,6 +385,16 @@ impl SessionManager {
             Action::Kill {
                 signal: "kill".to_string(),
             },
+            capture_git(&handle.config.workspace),
+        )?;
+        Ok(())
+    }
+
+    pub fn record_attach(&self, session_id: &str) -> Result<()> {
+        let handle = self.handle(session_id)?;
+        handle.log.append_action(
+            session_id,
+            Action::AttachHuman,
             capture_git(&handle.config.workspace),
         )?;
         Ok(())
@@ -1078,6 +1116,16 @@ fn tail_chars(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars().rev().take(max_chars).collect::<Vec<_>>();
     chars.reverse();
     chars.into_iter().collect()
+}
+
+fn slice_from_boundary(value: &str, mut start: usize) -> &str {
+    if start >= value.len() {
+        return "";
+    }
+    while start > 0 && !value.is_char_boundary(start) {
+        start -= 1;
+    }
+    &value[start..]
 }
 
 fn safe_filename(value: &str) -> String {
