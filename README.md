@@ -9,6 +9,52 @@ agents durable hands in a terminal: start a session, send input, observe the
 screen, wait for real conditions, record every mutation, and let a human or
 another agent audit what happened.
 
+## Five-Minute Quickstart
+
+Install from the public repo:
+
+```bash
+cargo install --git https://github.com/evalops/agent-pty
+```
+
+Run the self-contained demo first. It does not require a daemon:
+
+```bash
+agent-pty demo
+```
+
+The demo creates a disposable git repo under `~/.agent-pty/demos`, opens a real
+PTY session, runs a failing check, fixes the repo from inside the session, waits
+for the passing check, and writes proof artifacts. The output points to:
+
+- the demo workspace
+- a Markdown report
+- the generated proof bundle
+- the append-only event log
+
+For automation, use JSON output:
+
+```bash
+agent-pty demo --json
+```
+
+After that, try the persistent daemon flow:
+
+```bash
+agent-pty serve --socket ~/.agent-pty.sock
+```
+
+In another terminal:
+
+```bash
+agent-pty new --repo "$PWD" --name first-run
+agent-pty send first-run "printf 'hello from agent-pty\n'"
+agent-pty wait first-run --until "hello from agent-pty"
+agent-pty screen first-run --format markdown
+agent-pty proof first-run
+agent-pty kill first-run
+```
+
 ## What Works Now
 
 - Persistent PTY sessions through `portable-pty`.
@@ -32,6 +78,8 @@ another agent audit what happened.
 ## CLI
 
 ```bash
+agent-pty demo
+
 agent-pty serve --socket ~/.agent-pty.sock
 agent-pty serve-http --addr 127.0.0.1:4319
 agent-pty mcp-stdio
