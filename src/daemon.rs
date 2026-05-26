@@ -1,9 +1,9 @@
 use std::{
     collections::BTreeMap,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, mpsc},
     thread,
     time::Duration,
 };
@@ -92,6 +92,7 @@ pub enum Request {
         copy_worktree: bool,
     },
     TracePath,
+    Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +108,7 @@ pub enum ResponsePayload {
     Proof(ProofBundle),
     Forked(ForkResult),
     TracePath(PathBuf),
+    Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +222,7 @@ fn handle_request_inner(manager: &SessionManager, request: Request) -> Result<Re
         Request::TracePath => Ok(ResponsePayload::TracePath(
             manager.trace_path().to_path_buf(),
         )),
+        Request::Shutdown => bail!("shutdown is only supported by the Unix socket daemon"),
     }
 }
 
@@ -252,6 +255,7 @@ impl Request {
             Request::Proof { .. } => "terminal.proof",
             Request::Fork { .. } => "terminal.fork",
             Request::TracePath => "terminal.trace_path",
+            Request::Shutdown => "terminal.shutdown",
         }
         .to_string()
     }
@@ -266,7 +270,7 @@ impl Request {
             | Request::Replay { id }
             | Request::Proof { id }
             | Request::Fork { id, .. } => Some(id.clone()),
-            Request::List | Request::TracePath => None,
+            Request::List | Request::TracePath | Request::Shutdown => None,
         }
     }
 }
@@ -284,16 +288,35 @@ pub fn serve_unix(socket_path: impl AsRef<Path>, log_dir: impl Into<PathBuf>) ->
 
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("bind unix socket {}", socket_path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .context("set unix listener nonblocking")?;
     let manager = Arc::new(SessionManager::new(log_dir)?);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
-    for stream in listener.incoming() {
-        let stream = stream.context("accept unix socket connection")?;
-        let manager = Arc::clone(&manager);
-        thread::spawn(move || {
-            let _ = handle_stream(stream, manager);
-        });
+    loop {
+        if shutdown_rx.try_recv().is_ok() {
+            break;
+        }
+
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let manager = Arc::clone(&manager);
+                let shutdown_tx = shutdown_tx.clone();
+                thread::spawn(move || {
+                    if handle_stream(stream, manager).unwrap_or(false) {
+                        let _ = shutdown_tx.send(());
+                    }
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error).context("accept unix socket connection"),
+        }
     }
 
+    let _ = std::fs::remove_file(socket_path);
     Ok(())
 }
 
@@ -368,21 +391,29 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     ))
 }
 
-fn handle_stream(mut stream: UnixStream, manager: Arc<SessionManager>) -> Result<()> {
+fn handle_stream(mut stream: UnixStream, manager: Arc<SessionManager>) -> Result<bool> {
     let mut request = String::new();
     BufReader::new(stream.try_clone().context("clone unix stream")?)
         .read_line(&mut request)
         .context("read daemon request")?;
 
+    let mut shutdown = false;
     let response = match serde_json::from_str::<Request>(&request) {
-        Ok(request) => match handle_request(&manager, request) {
-            Ok(data) => WireResponse::ok(data),
-            Err(error) => WireResponse::error(format!("{error:#}")),
-        },
+        Ok(request) => {
+            shutdown = matches!(request, Request::Shutdown);
+            if shutdown {
+                WireResponse::ok(ResponsePayload::Shutdown)
+            } else {
+                match handle_request(&manager, request) {
+                    Ok(data) => WireResponse::ok(data),
+                    Err(error) => WireResponse::error(format!("{error:#}")),
+                }
+            }
+        }
         Err(error) => WireResponse::error(format!("invalid request: {error}")),
     };
 
     serde_json::to_writer(&mut stream, &response).context("serialize daemon response")?;
     stream.write_all(b"\n").context("write daemon response")?;
-    Ok(())
+    Ok(shutdown)
 }

@@ -118,3 +118,14 @@ fn daemon_rejects_dangerous_commands_before_they_reach_the_pty() {
     )
     .unwrap();
 }
+
+#[test]
+fn shutdown_is_a_unix_socket_control_message_not_a_generic_transport_request() {
+    let temp = TempDir::new().unwrap();
+    let manager = SessionManager::new(temp.path().join("logs")).unwrap();
+
+    let error = handle_request(&manager, Request::Shutdown)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Unix socket daemon"));
+}

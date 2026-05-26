@@ -1,7 +1,14 @@
-use std::{collections::BTreeMap, path::PathBuf, process::ExitCode};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command as ProcessCommand, ExitCode},
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 
 use agent_pty::{
     daemon::{Request, ResponsePayload, parse_duration, request_unix, serve_unix},
@@ -53,6 +60,26 @@ enum Command {
         #[arg(long, default_value = "/bin/sh")]
         shell: PathBuf,
         /// Print a machine-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report whether the Unix-socket daemon is reachable.
+    Status {
+        /// Print a machine-readable daemon status summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the Unix-socket daemon to shut down cleanly.
+    Stop,
+    /// Check local prerequisites, paths, and daemon reachability.
+    Doctor {
+        /// Session log directory to check for writability.
+        #[arg(long, default_value = "~/.agent-pty/runs")]
+        log_dir: PathBuf,
+        /// Shell path to validate.
+        #[arg(long, default_value = "/bin/sh")]
+        shell: PathBuf,
+        /// Print a machine-readable diagnostics summary.
         #[arg(long)]
         json: bool,
     },
@@ -180,6 +207,64 @@ fn run() -> Result<()> {
                 println!("event log: {}", summary.event_log_path.display());
             }
             Ok(())
+        }
+        Command::Status { json } => {
+            let summary = daemon_status(&socket);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else if summary.running {
+                println!(
+                    "agent-pty daemon running: {} session{}",
+                    summary.session_count,
+                    plural(summary.session_count)
+                );
+                if let Some(path) = &summary.trace_path {
+                    println!("trace log: {}", path.display());
+                }
+            } else {
+                println!(
+                    "agent-pty daemon not running: {}",
+                    summary.error.as_deref().unwrap_or("unreachable")
+                );
+            }
+            Ok(())
+        }
+        Command::Stop => {
+            let payload = request_unix(socket, &Request::Shutdown)?;
+            print_payload(payload, OutputFormat::Text, false)
+        }
+        Command::Doctor {
+            log_dir,
+            shell,
+            json,
+        } => {
+            let summary = run_doctor(&socket, expand_tilde(log_dir), expand_tilde(shell));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("doctor: {}", if summary.ok { "ok" } else { "failed" });
+                println!(
+                    "daemon: {}",
+                    if summary.daemon_running {
+                        "running"
+                    } else {
+                        "not running"
+                    }
+                );
+                for check in &summary.checks {
+                    println!(
+                        "- {}: {} ({})",
+                        check.name,
+                        if check.ok { "ok" } else { "failed" },
+                        check.detail
+                    );
+                }
+            }
+            if summary.ok {
+                Ok(())
+            } else {
+                anyhow::bail!("doctor found failing checks")
+            }
         }
         Command::New {
             repo,
@@ -335,6 +420,7 @@ fn print_payload(payload: ResponsePayload, format: OutputFormat, force_json: boo
             );
         }
         ResponsePayload::TracePath(path) => println!("{}", path.display()),
+        ResponsePayload::Shutdown => println!("stopped"),
         ResponsePayload::Screen(screen) => match format {
             OutputFormat::Text => print!("{}", screen.text),
             OutputFormat::Markdown => println!("```text\n{}\n```", screen.text.trim_end()),
@@ -363,6 +449,161 @@ fn print_payload(payload: ResponsePayload, format: OutputFormat, force_json: boo
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusSummary {
+    socket: PathBuf,
+    running: bool,
+    session_count: usize,
+    trace_path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorSummary {
+    ok: bool,
+    daemon_running: bool,
+    socket: PathBuf,
+    log_dir: PathBuf,
+    checks: Vec<DoctorCheck>,
+    status: StatusSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheck {
+    name: String,
+    ok: bool,
+    detail: String,
+}
+
+fn daemon_status(socket: &Path) -> StatusSummary {
+    match request_unix(socket, &Request::List) {
+        Ok(ResponsePayload::Sessions(sessions)) => {
+            let trace_path = match request_unix(socket, &Request::TracePath) {
+                Ok(ResponsePayload::TracePath(path)) => Some(path),
+                _ => None,
+            };
+            StatusSummary {
+                socket: socket.to_path_buf(),
+                running: true,
+                session_count: sessions.len(),
+                trace_path,
+                error: None,
+            }
+        }
+        Ok(other) => StatusSummary {
+            socket: socket.to_path_buf(),
+            running: true,
+            session_count: 0,
+            trace_path: None,
+            error: Some(format!("unexpected response: {other:?}")),
+        },
+        Err(error) => StatusSummary {
+            socket: socket.to_path_buf(),
+            running: false,
+            session_count: 0,
+            trace_path: None,
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
+fn run_doctor(socket: &Path, log_dir: PathBuf, shell: PathBuf) -> DoctorSummary {
+    let status = daemon_status(socket);
+    let checks = vec![
+        check_command("git", &["--version"]),
+        check_shell(&shell),
+        check_writable_dir("log_dir", &log_dir),
+        check_writable_dir(
+            "socket_parent",
+            socket.parent().unwrap_or_else(|| Path::new(".")),
+        ),
+    ];
+    let ok = checks.iter().all(|check| check.ok);
+    DoctorSummary {
+        ok,
+        daemon_running: status.running,
+        socket: socket.to_path_buf(),
+        log_dir,
+        checks,
+        status,
+    }
+}
+
+fn check_command(name: &str, args: &[&str]) -> DoctorCheck {
+    match ProcessCommand::new(name).args(args).output() {
+        Ok(output) if output.status.success() => DoctorCheck {
+            name: name.to_string(),
+            ok: true,
+            detail: String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("available")
+                .to_string(),
+        },
+        Ok(output) => DoctorCheck {
+            name: name.to_string(),
+            ok: false,
+            detail: String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("command failed")
+                .to_string(),
+        },
+        Err(error) => DoctorCheck {
+            name: name.to_string(),
+            ok: false,
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn check_shell(shell: &Path) -> DoctorCheck {
+    match ProcessCommand::new(shell).arg("-c").arg("exit 0").output() {
+        Ok(output) if output.status.success() => DoctorCheck {
+            name: "shell".to_string(),
+            ok: true,
+            detail: shell.display().to_string(),
+        },
+        Ok(output) => DoctorCheck {
+            name: "shell".to_string(),
+            ok: false,
+            detail: format!("{} exited with {}", shell.display(), output.status),
+        },
+        Err(error) => DoctorCheck {
+            name: "shell".to_string(),
+            ok: false,
+            detail: format!("{}: {error}", shell.display()),
+        },
+    }
+}
+
+fn check_writable_dir(name: &str, path: &Path) -> DoctorCheck {
+    let result = (|| -> Result<()> {
+        fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+        let probe = path.join(format!(".agent-pty-doctor-{}", std::process::id()));
+        let mut file =
+            fs::File::create(&probe).with_context(|| format!("write {}", probe.display()))?;
+        file.write_all(b"ok")
+            .with_context(|| format!("write {}", probe.display()))?;
+        drop(file);
+        fs::remove_file(&probe).with_context(|| format!("remove {}", probe.display()))?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => DoctorCheck {
+            name: name.to_string(),
+            ok: true,
+            detail: path.display().to_string(),
+        },
+        Err(error) => DoctorCheck {
+            name: name.to_string(),
+            ok: false,
+            detail: format!("{error:#}"),
+        },
+    }
 }
 
 fn expand_tilde(path: PathBuf) -> PathBuf {
