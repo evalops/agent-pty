@@ -132,3 +132,51 @@ cargo fmt -- --check
 cargo test
 cargo build
 ```
+
+## Deep Tmux E2E
+
+The deepest local check is an ignored black-box test that drives the compiled
+binary through real tmux panes and real daemon processes:
+
+```bash
+cargo test --test e2e_tmux -- --ignored --nocapture
+```
+
+The test invokes:
+
+```bash
+scripts/e2e-tmux.sh --ci --artifacts target/e2e-tmux/latest
+```
+
+It creates a temporary broken Rust repo from `fixtures/broken-rust-project`,
+starts a detached tmux session, and exercises:
+
+- Unix socket daemon and CLI commands
+- HTTP daemon with `curl`
+- MCP stdio JSON-RPC tools
+- interactive prompt handling with `read`
+- Python REPL interaction
+- long-running output and idle waits
+- ANSI/color and cursor-return output
+- blocked policy commands and audited denial evidence
+- git worktree forks for passing and failing repair attempts
+- proof bundles for both repair attempts
+- concurrent `replay` and `proof` clients hammering the same evidence log
+- daemon restart followed by replay from durable logs
+- tmux pane capture and `script` terminal transcript capture
+
+Artifacts are written under `target/e2e-tmux/latest`:
+
+- `report.md`
+- `tmux-driver-pane.txt`
+- `tmux-daemon-pane.txt`
+- `tmux-http-pane.txt`
+- `tmux-observer-pane.txt`
+- `driver.typescript`
+- `agent-pty-logs/*.jsonl`
+- `agent-pty-logs/traces.jsonl`
+- `proofs/*.proof.md`
+
+This harness is intentionally slower and more operationally realistic than the
+normal Cargo suite. It is the check to run before claiming that terminal,
+transport, replay, proof, policy, and artifact behavior work end to end.
