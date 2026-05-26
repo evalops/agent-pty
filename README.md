@@ -41,18 +41,21 @@ agent-pty demo --json
 After that, try the persistent daemon flow:
 
 ```bash
+agent-pty doctor
 agent-pty serve --socket ~/.agent-pty.sock
 ```
 
 In another terminal:
 
 ```bash
+agent-pty status
 agent-pty new --repo "$PWD" --name first-run
 agent-pty send first-run "printf 'hello from agent-pty\n'"
 agent-pty wait first-run --until "hello from agent-pty"
 agent-pty screen first-run --format markdown
 agent-pty proof first-run
 agent-pty kill first-run
+agent-pty stop
 ```
 
 ## What Works Now
@@ -71,6 +74,7 @@ agent-pty kill first-run
 - Git worktree-backed forks for parallel repair attempts.
 - Initial policy gate with audited denial events.
 - Unix-socket JSON daemon.
+- Daemon lifecycle diagnostics with `doctor`, `status`, and `stop`.
 - HTTP/JSON request surface.
 - MCP-compatible stdio JSON-RPC tool surface.
 - OTEL-style JSONL trace events for daemon requests.
@@ -80,7 +84,10 @@ agent-pty kill first-run
 ```bash
 agent-pty demo
 
+agent-pty doctor
 agent-pty serve --socket ~/.agent-pty.sock
+agent-pty status
+agent-pty stop
 agent-pty serve-http --addr 127.0.0.1:4319
 agent-pty mcp-stdio
 
@@ -113,7 +120,30 @@ connection carries one request and receives one response.
 {"op":"replay","id":"codex-1"}
 {"op":"trace_path"}
 {"op":"kill","id":"codex-1"}
+{"op":"shutdown"}
 ```
+
+## Daemon Lifecycle
+
+Use `doctor` before starting the daemon or when a user reports that the CLI
+cannot connect:
+
+```bash
+agent-pty doctor
+agent-pty doctor --json
+```
+
+Use `status` and `stop` for day-to-day lifecycle checks:
+
+```bash
+agent-pty status
+agent-pty status --json
+agent-pty stop
+```
+
+`status --json` succeeds even when the daemon is unreachable, returning
+`running: false` with the connection diagnostic in `error`. That makes it safe
+for scripts and agents to call without turning "not running" into an exception.
 
 ## HTTP Transport
 
