@@ -6,6 +6,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use agent_pty::{
     daemon::{Request, ResponsePayload, parse_duration, request_unix, serve_unix},
     evidence::{Action, EventKind},
+    http::serve_http,
+    mcp::serve_mcp_stdio,
 };
 
 #[derive(Debug, Parser)]
@@ -22,6 +24,16 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Serve {
+        #[arg(long, default_value = "~/.agent-pty/runs")]
+        log_dir: PathBuf,
+    },
+    ServeHttp {
+        #[arg(long, default_value = "127.0.0.1:4319")]
+        addr: String,
+        #[arg(long, default_value = "~/.agent-pty/runs")]
+        log_dir: PathBuf,
+    },
+    McpStdio {
         #[arg(long, default_value = "~/.agent-pty/runs")]
         log_dir: PathBuf,
     },
@@ -63,6 +75,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Proof {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Fork {
+        name: String,
+        #[arg(long)]
+        new_name: String,
+        #[arg(long)]
+        copy_worktree: bool,
+    },
+    TracePath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -92,6 +121,12 @@ fn run() -> Result<()> {
             println!("agent-pty listening on {}", socket.display());
             serve_unix(socket, log_dir)
         }
+        Command::ServeHttp { addr, log_dir } => {
+            let log_dir = expand_tilde(log_dir);
+            println!("agent-pty HTTP listening on {addr}");
+            serve_http(addr, log_dir)
+        }
+        Command::McpStdio { log_dir } => serve_mcp_stdio(expand_tilde(log_dir)),
         Command::New {
             repo,
             name,
@@ -162,6 +197,43 @@ fn run() -> Result<()> {
             };
             print_payload(payload, format, false)
         }
+        Command::List { json } => {
+            let payload = request_unix(socket, &Request::List)?;
+            let format = if json {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Text
+            };
+            print_payload(payload, format, false)
+        }
+        Command::Proof { name, json } => {
+            let payload = request_unix(socket, &Request::Proof { id: name })?;
+            let format = if json {
+                OutputFormat::Json
+            } else {
+                OutputFormat::Text
+            };
+            print_payload(payload, format, false)
+        }
+        Command::Fork {
+            name,
+            new_name,
+            copy_worktree,
+        } => {
+            let payload = request_unix(
+                socket,
+                &Request::Fork {
+                    id: name,
+                    name: new_name,
+                    copy_worktree,
+                },
+            )?;
+            print_payload(payload, OutputFormat::Text, false)
+        }
+        Command::TracePath => {
+            let payload = request_unix(socket, &Request::TracePath)?;
+            print_payload(payload, OutputFormat::Text, false)
+        }
     }
 }
 
@@ -175,6 +247,40 @@ fn print_payload(payload: ResponsePayload, format: OutputFormat, force_json: boo
         ResponsePayload::SessionCreated { id } => println!("created session {id}"),
         ResponsePayload::Sent => println!("sent"),
         ResponsePayload::Killed => println!("killed"),
+        ResponsePayload::Sessions(sessions) => {
+            if format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else {
+                for session in sessions {
+                    println!(
+                        "{} active={} pid={} workspace={}",
+                        session.id,
+                        session.active,
+                        session
+                            .process_id
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        session.workspace.display()
+                    );
+                }
+            }
+        }
+        ResponsePayload::Proof(proof) => {
+            if format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&proof)?);
+            } else {
+                println!("{}", proof.markdown_path.display());
+            }
+        }
+        ResponsePayload::Forked(fork) => {
+            println!(
+                "forked {} from {} at {}",
+                fork.id,
+                fork.source_id,
+                fork.workspace.display()
+            );
+        }
+        ResponsePayload::TracePath(path) => println!("{}", path.display()),
         ResponsePayload::Screen(screen) => match format {
             OutputFormat::Text => print!("{}", screen.text),
             OutputFormat::Markdown => println!("```text\n{}\n```", screen.text.trim_end()),
@@ -240,6 +346,26 @@ fn event_label(kind: &EventKind) -> String {
             Action::SnapshotFiles { globs } => format!("snapshot files {}", globs.join(",")),
             Action::Kill { signal } => format!("kill {signal}"),
             Action::AttachHuman => "attach human".to_string(),
+            Action::PolicyDenied { command, rule } => {
+                format!("policy denied {rule}: {command}")
+            }
+            Action::Fork {
+                source,
+                target,
+                workspace,
+            } => {
+                format!("fork {source} -> {target} at {}", workspace.display())
+            }
+            Action::Proof {
+                json_path,
+                markdown_path,
+            } => {
+                format!(
+                    "proof json={} markdown={}",
+                    json_path.display(),
+                    markdown_path.display()
+                )
+            }
         },
         EventKind::Observation(observation) => {
             let changed = observation.files_changed.len();

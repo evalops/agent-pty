@@ -11,10 +11,14 @@ use std::{
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
     evidence::EvidenceEvent,
-    session::{ScreenSnapshot, SessionConfig, SessionManager, SessionObservation, WaitCondition},
+    session::{
+        ForkResult, ProofBundle, ScreenSnapshot, SessionConfig, SessionManager, SessionMetadata,
+        SessionObservation, TraceEvent, WaitCondition,
+    },
 };
 
 static DANGEROUS_COMMANDS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
@@ -78,6 +82,16 @@ pub enum Request {
     Replay {
         id: String,
     },
+    List,
+    Proof {
+        id: String,
+    },
+    Fork {
+        id: String,
+        name: String,
+        copy_worktree: bool,
+    },
+    TracePath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +103,10 @@ pub enum ResponsePayload {
     Observation(SessionObservation),
     Killed,
     Replay(Vec<EvidenceEvent>),
+    Sessions(Vec<SessionMetadata>),
+    Proof(ProofBundle),
+    Forked(ForkResult),
+    TracePath(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +135,29 @@ impl WireResponse {
 }
 
 pub fn handle_request(manager: &SessionManager, request: Request) -> Result<ResponsePayload> {
+    let request_name = request.name();
+    let session_id = request.session_id();
+    let started_at = chrono::Utc::now();
+    let result = handle_request_inner(manager, request);
+    let ended_at = chrono::Utc::now();
+    let mut attributes = BTreeMap::new();
+    attributes.insert("component".to_string(), "agent-pty".to_string());
+    if let Some(session_id) = session_id {
+        attributes.insert("session.id".to_string(), session_id);
+    }
+    let _ = manager.append_trace(TraceEvent {
+        trace_id: Uuid::new_v4().to_string(),
+        span_id: Uuid::new_v4().to_string(),
+        name: request_name,
+        started_at,
+        ended_at,
+        status: if result.is_ok() { "ok" } else { "error" }.to_string(),
+        attributes,
+    });
+    result
+}
+
+fn handle_request_inner(manager: &SessionManager, request: Request) -> Result<ResponsePayload> {
     match request {
         Request::New {
             id,
@@ -137,7 +178,10 @@ pub fn handle_request(manager: &SessionManager, request: Request) -> Result<Resp
             Ok(ResponsePayload::SessionCreated { id })
         }
         Request::Send { id, text, enter } => {
-            enforce_action_policy(&text)?;
+            if let Some(rule) = action_policy_violation(&text) {
+                manager.record_policy_denial(&id, &text, rule)?;
+                bail!("{rule} requires approval before it can be sent to the PTY");
+            }
             if enter {
                 manager.send_line(&id, &text)?;
             } else {
@@ -162,16 +206,69 @@ pub fn handle_request(manager: &SessionManager, request: Request) -> Result<Resp
             Ok(ResponsePayload::Killed)
         }
         Request::Replay { id } => Ok(ResponsePayload::Replay(manager.replay(&id)?)),
+        Request::List => Ok(ResponsePayload::Sessions(manager.list_sessions()?)),
+        Request::Proof { id } => Ok(ResponsePayload::Proof(manager.proof(&id)?)),
+        Request::Fork {
+            id,
+            name,
+            copy_worktree,
+        } => Ok(ResponsePayload::Forked(manager.fork(
+            &id,
+            &name,
+            copy_worktree,
+        )?)),
+        Request::TracePath => Ok(ResponsePayload::TracePath(
+            manager.trace_path().to_path_buf(),
+        )),
     }
 }
 
 pub fn enforce_action_policy(text: &str) -> Result<()> {
-    for (regex, label) in DANGEROUS_COMMANDS.iter() {
-        if regex.is_match(text) {
-            bail!("{label} requires approval before it can be sent to the PTY");
-        }
+    if let Some(label) = action_policy_violation(text) {
+        bail!("{label} requires approval before it can be sent to the PTY");
     }
     Ok(())
+}
+
+pub fn action_policy_violation(text: &str) -> Option<&'static str> {
+    for (regex, label) in DANGEROUS_COMMANDS.iter() {
+        if regex.is_match(text) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+impl Request {
+    fn name(&self) -> String {
+        match self {
+            Request::New { .. } => "terminal.new",
+            Request::Send { .. } => "terminal.send",
+            Request::Screen { .. } => "terminal.screen",
+            Request::Wait { .. } => "terminal.wait",
+            Request::Kill { .. } => "terminal.kill",
+            Request::Replay { .. } => "terminal.replay",
+            Request::List => "terminal.list",
+            Request::Proof { .. } => "terminal.proof",
+            Request::Fork { .. } => "terminal.fork",
+            Request::TracePath => "terminal.trace_path",
+        }
+        .to_string()
+    }
+
+    fn session_id(&self) -> Option<String> {
+        match self {
+            Request::New { id, .. }
+            | Request::Send { id, .. }
+            | Request::Screen { id }
+            | Request::Wait { id, .. }
+            | Request::Kill { id }
+            | Request::Replay { id }
+            | Request::Proof { id }
+            | Request::Fork { id, .. } => Some(id.clone()),
+            Request::List | Request::TracePath => None,
+        }
+    }
 }
 
 pub fn serve_unix(socket_path: impl AsRef<Path>, log_dir: impl Into<PathBuf>) -> Result<()> {

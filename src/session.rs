@@ -1,13 +1,16 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fs,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,55 @@ pub struct SessionConfig {
     pub cols: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    pub id: String,
+    pub workspace: PathBuf,
+    pub shell: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub started_at: DateTime<Utc>,
+    pub process_id: Option<u32>,
+    pub active: bool,
+    pub log_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkResult {
+    pub id: String,
+    pub source_id: String,
+    pub workspace: PathBuf,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofBundle {
+    pub session_id: String,
+    pub generated_at: DateTime<Utc>,
+    pub event_count: usize,
+    pub commands_run: Vec<String>,
+    pub files_changed: Vec<FileChange>,
+    pub risk_flags: Vec<String>,
+    pub latest_git_status: Option<String>,
+    pub git_diff: Option<String>,
+    pub screen_tail: String,
+    pub log_path: PathBuf,
+    pub json_path: PathBuf,
+    pub markdown_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEvent {
+    pub trace_id: String,
+    pub span_id: String,
+    pub name: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    pub status: String,
+    pub attributes: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
     Regex { pattern: String },
@@ -49,6 +101,21 @@ pub struct SessionObservation {
     pub exit_status: Option<i32>,
     pub files_changed: Vec<FileChange>,
     pub git_snapshot: Option<GitSnapshot>,
+    pub process_snapshot: Option<ProcessSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessSnapshot {
+    pub root_pid: u32,
+    pub processes: Vec<ProcessInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub stat: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +147,9 @@ pub enum SpanKind {
 
 pub struct SessionManager {
     log_dir: PathBuf,
+    index_path: PathBuf,
+    proof_dir: PathBuf,
+    trace_path: PathBuf,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
 }
 
@@ -88,7 +158,13 @@ impl SessionManager {
         let log_dir = log_dir.into();
         std::fs::create_dir_all(&log_dir)
             .with_context(|| format!("create session log dir {}", log_dir.display()))?;
+        let proof_dir = log_dir.join("proofs");
+        std::fs::create_dir_all(&proof_dir)
+            .with_context(|| format!("create proof dir {}", proof_dir.display()))?;
         Ok(Self {
+            index_path: log_dir.join("sessions.json"),
+            trace_path: log_dir.join("traces.jsonl"),
+            proof_dir,
             log_dir,
             sessions: Mutex::new(HashMap::new()),
         })
@@ -124,15 +200,20 @@ impl SessionManager {
             .slave
             .spawn_command(command)
             .with_context(|| format!("spawn shell {}", config.shell.display()))?;
+        let process_id = child.process_id();
         drop(pair.slave);
 
         let mut reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer = pair.master.take_writer().context("take pty writer")?;
-        let log = EventLog::open(self.log_path(&config.id))?;
+        let log_path = self.log_path(&config.id);
+        let log = EventLog::open(log_path.clone())?;
         let state = Arc::new(Mutex::new(SessionState::new(config.rows, config.cols)));
+        let started_at = Utc::now();
 
         let handle = Arc::new(SessionHandle {
             config: config.clone(),
+            started_at,
+            process_id,
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             state: Arc::clone(&state),
@@ -170,7 +251,19 @@ impl SessionManager {
         self.sessions
             .lock()
             .expect("session registry lock poisoned")
-            .insert(config.id, handle);
+            .insert(config.id.clone(), Arc::clone(&handle));
+        self.persist_metadata(&SessionMetadata {
+            id: config.id,
+            workspace: config.workspace,
+            shell: config.shell,
+            env: config.env,
+            rows: config.rows,
+            cols: config.cols,
+            started_at,
+            process_id,
+            active: true,
+            log_path,
+        })?;
         Ok(())
     }
 
@@ -283,6 +376,191 @@ impl SessionManager {
         EventLog::open(self.log_path(session_id))?.replay()
     }
 
+    pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
+        let mut by_id = self
+            .read_index()?
+            .into_iter()
+            .map(|mut metadata| {
+                metadata.active = false;
+                (metadata.id.clone(), metadata)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for handle in self
+            .sessions
+            .lock()
+            .expect("session registry lock poisoned")
+            .values()
+        {
+            by_id.insert(handle.config.id.clone(), self.metadata_for_handle(handle));
+        }
+
+        Ok(by_id.into_values().collect())
+    }
+
+    pub fn record_policy_denial(&self, session_id: &str, command: &str, rule: &str) -> Result<()> {
+        let git_snapshot = self
+            .sessions
+            .lock()
+            .expect("session registry lock poisoned")
+            .get(session_id)
+            .and_then(|handle| capture_git(&handle.config.workspace));
+        EventLog::open(self.log_path(session_id))?.append_action(
+            session_id,
+            Action::PolicyDenied {
+                command: command.to_string(),
+                rule: rule.to_string(),
+            },
+            git_snapshot,
+        )?;
+        Ok(())
+    }
+
+    pub fn fork(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        copy_worktree: bool,
+    ) -> Result<ForkResult> {
+        let source = self.handle(source_id)?;
+        let mut target_config = source.config.clone();
+        target_config.id = target_id.to_string();
+
+        let (workspace, branch) = if copy_worktree {
+            create_worktree_fork(&source.config.workspace, target_id)?
+        } else {
+            (source.config.workspace.clone(), None)
+        };
+        target_config.workspace = workspace.clone();
+
+        self.open(target_config)?;
+        source.log.append_action(
+            source_id,
+            Action::Fork {
+                source: source_id.to_string(),
+                target: target_id.to_string(),
+                workspace: workspace.clone(),
+            },
+            capture_git(&source.config.workspace),
+        )?;
+
+        Ok(ForkResult {
+            id: target_id.to_string(),
+            source_id: source_id.to_string(),
+            workspace,
+            branch,
+        })
+    }
+
+    pub fn proof(&self, session_id: &str) -> Result<ProofBundle> {
+        let events = self.replay(session_id)?;
+        let mut commands_run = Vec::new();
+        let mut files_changed = BTreeMap::<PathBuf, FileChange>::new();
+        let mut risk_flags = BTreeSet::<String>::new();
+        let mut latest_git_status = None;
+        let mut git_diff = None;
+        let mut screen_tail = String::new();
+
+        for event in &events {
+            if let Some(snapshot) = &event.git_snapshot {
+                latest_git_status = Some(snapshot.status_short.clone());
+                git_diff = Some(snapshot.diff.clone());
+                for change in files_changed_from_git(snapshot) {
+                    files_changed.insert(change.path.clone(), change);
+                }
+            }
+
+            match &event.kind {
+                crate::evidence::EventKind::Action(action) => match action {
+                    Action::SendKeys { bytes } => {
+                        let command = String::from_utf8_lossy(bytes).trim().to_string();
+                        if !command.is_empty() {
+                            commands_run.push(command);
+                        }
+                    }
+                    Action::Exec { argv, cwd } => {
+                        commands_run.push(format!("{} # cwd={}", argv.join(" "), cwd.display()));
+                    }
+                    Action::PolicyDenied { command, rule } => {
+                        risk_flags.insert(format!("blocked {rule}: {command}"));
+                    }
+                    _ => {}
+                },
+                crate::evidence::EventKind::Observation(observation) => {
+                    if let Some(screen) = &observation.screen_text {
+                        screen_tail = tail_chars(screen, 8_000);
+                    } else if !observation.stdout_tail.is_empty() {
+                        screen_tail = tail_chars(&observation.stdout_tail, 8_000);
+                    }
+                    if let Some(snapshot) = &observation.git_snapshot {
+                        latest_git_status = Some(snapshot.status_short.clone());
+                        git_diff = Some(snapshot.diff.clone());
+                    }
+                    for change in &observation.files_changed {
+                        files_changed.insert(change.path.clone(), change.clone());
+                    }
+                    if let Some(status) = observation.exit_status
+                        && status != 0
+                    {
+                        risk_flags.insert(format!("nonzero exit status {status}"));
+                    }
+                }
+            }
+        }
+
+        let json_path = self
+            .proof_dir
+            .join(format!("{}.proof.json", safe_filename(session_id)));
+        let markdown_path = self
+            .proof_dir
+            .join(format!("{}.proof.md", safe_filename(session_id)));
+        let proof = ProofBundle {
+            session_id: session_id.to_string(),
+            generated_at: Utc::now(),
+            event_count: events.len(),
+            commands_run,
+            files_changed: files_changed.into_values().collect(),
+            risk_flags: risk_flags.into_iter().collect(),
+            latest_git_status,
+            git_diff,
+            screen_tail,
+            log_path: self.log_path(session_id),
+            json_path,
+            markdown_path,
+        };
+
+        fs::write(&proof.json_path, serde_json::to_vec_pretty(&proof)?)
+            .with_context(|| format!("write proof json {}", proof.json_path.display()))?;
+        fs::write(&proof.markdown_path, render_proof_markdown(&proof))
+            .with_context(|| format!("write proof markdown {}", proof.markdown_path.display()))?;
+        EventLog::open(self.log_path(session_id))?.append_action(
+            session_id,
+            Action::Proof {
+                json_path: proof.json_path.clone(),
+                markdown_path: proof.markdown_path.clone(),
+            },
+            None,
+        )?;
+
+        Ok(proof)
+    }
+
+    pub fn append_trace(&self, event: TraceEvent) -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.trace_path)
+            .with_context(|| format!("open trace log {}", self.trace_path.display()))?;
+        serde_json::to_writer(&mut file, &event).context("serialize trace event")?;
+        file.write_all(b"\n")
+            .with_context(|| format!("write trace log {}", self.trace_path.display()))?;
+        Ok(())
+    }
+
+    pub fn trace_path(&self) -> &Path {
+        &self.trace_path
+    }
+
     fn observation_from(&self, handle: &SessionHandle) -> SessionObservation {
         let state = handle.state.lock().expect("session state lock poisoned");
         let screen = state.screen_snapshot();
@@ -303,6 +581,7 @@ impl SessionManager {
             exit_status,
             files_changed,
             git_snapshot,
+            process_snapshot: handle.process_id.and_then(process_snapshot),
         }
     }
 
@@ -346,10 +625,56 @@ impl SessionManager {
         self.log_dir
             .join(format!("{}.jsonl", safe_filename(session_id)))
     }
+
+    fn metadata_for_handle(&self, handle: &SessionHandle) -> SessionMetadata {
+        SessionMetadata {
+            id: handle.config.id.clone(),
+            workspace: handle.config.workspace.clone(),
+            shell: handle.config.shell.clone(),
+            env: handle.config.env.clone(),
+            rows: handle.config.rows,
+            cols: handle.config.cols,
+            started_at: handle.started_at,
+            process_id: handle.process_id,
+            active: true,
+            log_path: self.log_path(&handle.config.id),
+        }
+    }
+
+    fn read_index(&self) -> Result<Vec<SessionMetadata>> {
+        if !self.index_path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&self.index_path)
+            .with_context(|| format!("read session index {}", self.index_path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse session index {}", self.index_path.display()))
+    }
+
+    fn write_index(&self, sessions: &[SessionMetadata]) -> Result<()> {
+        fs::write(&self.index_path, serde_json::to_vec_pretty(sessions)?)
+            .with_context(|| format!("write session index {}", self.index_path.display()))
+    }
+
+    fn persist_metadata(&self, metadata: &SessionMetadata) -> Result<()> {
+        let mut sessions = self.read_index()?;
+        if let Some(existing) = sessions
+            .iter_mut()
+            .find(|session| session.id == metadata.id)
+        {
+            *existing = metadata.clone();
+        } else {
+            sessions.push(metadata.clone());
+        }
+        sessions.sort_by(|left, right| left.id.cmp(&right.id));
+        self.write_index(&sessions)
+    }
 }
 
 struct SessionHandle {
     config: SessionConfig,
+    started_at: DateTime<Utc>,
+    process_id: Option<u32>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     state: Arc<Mutex<SessionState>>,
@@ -570,6 +895,183 @@ fn files_changed_from_git(snapshot: &GitSnapshot) -> Vec<FileChange> {
 
 fn capture_git(workspace: &std::path::Path) -> Option<GitSnapshot> {
     GitSnapshot::capture(workspace).ok()
+}
+
+fn create_worktree_fork(
+    source_workspace: &Path,
+    target_id: &str,
+) -> Result<(PathBuf, Option<String>)> {
+    let safe_target = safe_filename(target_id);
+    let fork_root = source_workspace
+        .parent()
+        .unwrap_or(source_workspace)
+        .join(format!(
+            "{}.agent-pty-forks",
+            source_workspace
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace")
+        ));
+    fs::create_dir_all(&fork_root)
+        .with_context(|| format!("create fork root {}", fork_root.display()))?;
+    let target_workspace = fork_root.join(&safe_target);
+
+    if ensure_git_worktree(source_workspace).is_ok() {
+        if target_workspace.exists() {
+            bail!(
+                "fork workspace already exists: {}",
+                target_workspace.display()
+            );
+        }
+        let branch = format!("agent-pty/{safe_target}");
+        let output = Command::new("git")
+            .args(["worktree", "add", "-b", &branch])
+            .arg(&target_workspace)
+            .arg("HEAD")
+            .current_dir(source_workspace)
+            .output()
+            .with_context(|| format!("create git worktree {}", target_workspace.display()))?;
+        if !output.status.success() {
+            bail!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Ok((target_workspace, Some(branch)));
+    }
+
+    copy_dir(source_workspace, &target_workspace)?;
+    Ok((target_workspace, None))
+}
+
+fn ensure_git_worktree(workspace: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(workspace)
+        .output()
+        .with_context(|| format!("run git in {}", workspace.display()))?;
+
+    if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true" {
+        Ok(())
+    } else {
+        bail!("{} is not a git worktree", workspace.display());
+    }
+}
+
+fn copy_dir(source: &Path, target: &Path) -> Result<()> {
+    if target.exists() {
+        bail!("fork workspace already exists: {}", target.display());
+    }
+    fs::create_dir_all(target).with_context(|| format!("create {}", target.display()))?;
+    for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "copy {} to {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn render_proof_markdown(proof: &ProofBundle) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("# agent-pty proof: {}\n\n", proof.session_id));
+    output.push_str(&format!("- Generated: {}\n", proof.generated_at));
+    output.push_str(&format!("- Events: {}\n", proof.event_count));
+    output.push_str(&format!("- Event log: `{}`\n", proof.log_path.display()));
+    output.push_str("\n## Commands\n\n");
+    if proof.commands_run.is_empty() {
+        output.push_str("- none recorded\n");
+    } else {
+        for command in &proof.commands_run {
+            output.push_str(&format!("- `{}`\n", command.replace('`', "\\`")));
+        }
+    }
+    output.push_str("\n## Files Changed\n\n");
+    if proof.files_changed.is_empty() {
+        output.push_str("- none recorded\n");
+    } else {
+        for change in &proof.files_changed {
+            output.push_str(&format!(
+                "- `{}` {}\n",
+                change.path.display(),
+                change.status
+            ));
+        }
+    }
+    output.push_str("\n## Risk Flags\n\n");
+    if proof.risk_flags.is_empty() {
+        output.push_str("- none\n");
+    } else {
+        for flag in &proof.risk_flags {
+            output.push_str(&format!("- {flag}\n"));
+        }
+    }
+    output.push_str("\n## Screen Tail\n\n```text\n");
+    output.push_str(proof.screen_tail.trim_end());
+    output.push_str("\n```\n");
+    output
+}
+
+fn process_snapshot(root_pid: u32) -> Option<ProcessSnapshot> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,stat=,command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let all = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_process_info)
+        .collect::<Vec<_>>();
+    let mut wanted = HashSet::from([root_pid]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for process in &all {
+            if wanted.contains(&process.ppid) && wanted.insert(process.pid) {
+                changed = true;
+            }
+        }
+    }
+
+    let processes = all
+        .into_iter()
+        .filter(|process| wanted.contains(&process.pid))
+        .collect::<Vec<_>>();
+    if processes.is_empty() {
+        None
+    } else {
+        Some(ProcessSnapshot {
+            root_pid,
+            processes,
+        })
+    }
+}
+
+fn parse_process_info(line: &str) -> Option<ProcessInfo> {
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let ppid = parts.next()?.parse().ok()?;
+    let stat = parts.next()?.to_string();
+    let command = parts.collect::<Vec<_>>().join(" ");
+    Some(ProcessInfo {
+        pid,
+        ppid,
+        stat,
+        command,
+    })
 }
 
 fn tail_chars(value: &str, max_chars: usize) -> String {

@@ -150,6 +150,19 @@ pub enum Action {
         signal: String,
     },
     AttachHuman,
+    PolicyDenied {
+        command: String,
+        rule: String,
+    },
+    Fork {
+        source: String,
+        target: String,
+        workspace: PathBuf,
+    },
+    Proof {
+        json_path: PathBuf,
+        markdown_path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
