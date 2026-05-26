@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::Arc,
@@ -63,12 +63,31 @@ pub fn serve_http_listener(listener: TcpListener, log_dir: impl Into<PathBuf>) -
 }
 
 fn handle_stream(manager: &SessionManager, stream: &mut TcpStream) -> Result<()> {
-    let mut buffer = Vec::new();
-    stream
-        .read_to_end(&mut buffer)
-        .context("read HTTP request")?;
-    let raw_request = String::from_utf8_lossy(&buffer);
-    let response = handle_http_request(manager, &raw_request)?;
+    let mut reader = BufReader::new(stream.try_clone().context("clone HTTP stream")?);
+    let mut request = String::new();
+    let mut content_length = 0_usize;
+
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).context("read HTTP header")?;
+        if bytes == 0 {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            content_length = value.trim().parse().context("parse content-length")?;
+        }
+        request.push_str(&line);
+        if line == "\r\n" {
+            break;
+        }
+    }
+
+    let mut body = vec![0_u8; content_length];
+    reader.read_exact(&mut body).context("read HTTP body")?;
+    request.push_str(&String::from_utf8_lossy(&body));
+
+    let response = handle_http_request(manager, &request)?;
     stream
         .write_all(response.as_bytes())
         .context("write HTTP response")?;

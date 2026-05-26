@@ -1,40 +1,55 @@
 # agent-pty
 
-Agent terminal substrate: persistent PTY sessions with replayable evidence,
-semantic screen reads, predicate waits, git-aware snapshots, and policy hooks.
+Agent terminal substrate: persistent PTY sessions with semantic screen reads,
+predicate waits, replayable evidence, policy gates, proof bundles, forks, and
+agent-compatible transports.
 
 This is the layer below agent orchestration frameworks. It gives coding and ops
 agents durable hands in a terminal: start a session, send input, observe the
-screen, wait for real conditions, record every mutation, and let a human attach
-or audit what happened.
+screen, wait for real conditions, record every mutation, and let a human or
+another agent audit what happened.
 
-## MVP shape
+## What Works Now
 
-- Spawn persistent PTY sessions through `portable-pty`.
-- Send bytes/commands to a live session.
-- Capture terminal output through `vt100` and expose screen text plus structured
-  spans for prompts, output, error-looking lines, URLs, and file paths.
-- Wait for prompt, regex/text, exit, or idle predicates.
-- Persist append-only JSONL event logs.
-- Snapshot git diff/status around mutating actions when the workspace is a git
-  repo.
-- Expose a CLI and one-request-per-connection Unix JSON socket.
-- Intercept obvious dangerous command families before they reach the PTY.
+- Persistent PTY sessions through `portable-pty`.
+- `vt100` screen snapshots with spans for prompts, output, error-looking lines,
+  URLs, and file paths.
+- Predicate waits for literal/regex text, prompt return, idle output, and
+  process exit.
+- Append-only JSONL evidence logs for actions and observations.
+- Git status/diff snapshots around mutating actions.
+- Durable session index with workspace, shell, env, pid, dimensions, start time,
+  active state, and event-log path.
+- Process snapshots in observations, including root pid and child processes.
+- Proof bundles as JSON and Markdown artifacts.
+- Git worktree-backed forks for parallel repair attempts.
+- Initial policy gate with audited denial events.
+- Unix-socket JSON daemon.
+- HTTP/JSON request surface.
+- MCP-compatible stdio JSON-RPC tool surface.
+- OTEL-style JSONL trace events for daemon requests.
 
-## Working CLI
+## CLI
 
 ```bash
 agent-pty serve --socket ~/.agent-pty.sock
+agent-pty serve-http --addr 127.0.0.1:4319
+agent-pty mcp-stdio
+
 agent-pty new --repo ~/src/evalops/platform --name codex-1
 agent-pty send codex-1 "cargo test"
 agent-pty screen codex-1 --format markdown
 agent-pty wait codex-1 --until "finished in"
 agent-pty wait codex-1 --until "idle:2s"
+agent-pty list
+agent-pty proof codex-1
 agent-pty replay codex-1 --json
+agent-pty fork codex-1 --new-name repair-b --copy-worktree
+agent-pty trace-path
 agent-pty kill codex-1
 ```
 
-## Socket protocol
+## Unix Socket Protocol
 
 The daemon accepts newline-delimited JSON on the configured Unix socket. Each
 connection carries one request and receives one response.
@@ -44,14 +59,61 @@ connection carries one request and receives one response.
 {"op":"send","id":"codex-1","text":"cargo test","enter":true}
 {"op":"wait","id":"codex-1","until":"regex:finished in","timeout_ms":30000}
 {"op":"screen","id":"codex-1"}
+{"op":"list"}
+{"op":"proof","id":"codex-1"}
+{"op":"fork","id":"codex-1","name":"repair-b","copy_worktree":true}
 {"op":"replay","id":"codex-1"}
+{"op":"trace_path"}
 {"op":"kill","id":"codex-1"}
 ```
 
-## Policy gate
+## HTTP Transport
 
-The first built-in policy denies high-risk commands until an approval/dry-run
-flow exists:
+`agent-pty serve-http` exposes the same request model over `POST /request`.
+
+```bash
+curl -sS http://127.0.0.1:4319/request \
+  -d '{"op":"screen","id":"codex-1"}'
+```
+
+Responses use the same envelope as the Unix socket transport:
+
+```json
+{"ok":true,"data":{"type":"screen","data":{"rows":24,"cols":80,"text":"...","spans":[]}},"error":null}
+```
+
+## MCP Tools
+
+`agent-pty mcp-stdio` exposes these MCP-compatible tools over stdio JSON-RPC:
+
+- `terminal.new`
+- `terminal.send`
+- `terminal.screen`
+- `terminal.wait`
+- `terminal.kill`
+- `terminal.replay`
+- `terminal.list`
+- `terminal.proof`
+- `terminal.fork`
+
+## Evidence Model
+
+Every action and observation is written to the session JSONL log. A proof bundle
+summarizes:
+
+- commands run
+- files changed
+- latest git status and diff
+- blocked policy actions
+- nonzero exits
+- screen tail
+- event-log path
+- generated JSON and Markdown artifact paths
+
+## Policy Gate
+
+The built-in policy blocks and audits these high-risk command families before
+they reach the PTY:
 
 - `rm -rf`
 - `git push --force`
@@ -60,18 +122,13 @@ flow exists:
 - `vault write`
 - `gh pr merge`
 
-## Next layers
+Policy denials become evidence events, so a run can prove that a dangerous
+mutation was avoided rather than silently skipped.
 
-- HTTP/JSON wrapper around the same request handler.
-- MCP compatibility tools for `terminal.new`, `terminal.send`,
-  `terminal.screen`, `terminal.wait`, `terminal.kill`, and `terminal.replay`.
-- OpenTelemetry spans around session actions and waits.
-- Durable daemon restart/reconnect and session index persistence.
-- Worktree/session fork support.
+## Local Verification
 
-## Non-goals
-
-- Not a shell replacement.
-- Not a LangGraph clone.
-- Not a browser automation layer.
-- Not a terminal emulator UI.
+```bash
+cargo fmt -- --check
+cargo test
+cargo build
+```
