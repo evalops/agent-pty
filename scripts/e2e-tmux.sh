@@ -158,6 +158,7 @@ write_report() {
     echo "- tmux capture: ok"
     echo "- policy denial: ok"
     echo "- policy approval: ok"
+    echo "- semantic screen: ok"
     echo "- prompt interaction: ok"
     echo "- human attach: ok"
     echo "- REPL interaction: ok"
@@ -194,6 +195,15 @@ must policy_approved_replay "$BIN" --socket "$SOCKET" replay base
 assert_contains "$ARTIFACTS/policy_approved_replay.out" "policy approval created"
 assert_contains "$ARTIFACTS/policy_approved_replay.out" "policy approved"
 record policy_approval
+
+must semantic_send "$BIN" --socket "$SOCKET" send base "printf 'error: semantic failure at src/lib.rs:1 http://localhost:1234/build\n'"
+must semantic_wait "$BIN" --socket "$SOCKET" wait base --until "semantic failure" --timeout 10s
+must semantic_screen "$BIN" --socket "$SOCKET" screen base --format json
+assert_contains "$ARTIFACTS/semantic_screen.out" '"semantic"'
+assert_contains "$ARTIFACTS/semantic_screen.out" '"error_lines"'
+assert_contains "$ARTIFACTS/semantic_screen.out" 'http://localhost:1234/build'
+assert_contains "$ARTIFACTS/semantic_screen.out" 'src/lib.rs:1'
+record semantic_screen
 
 must prompt_send "$BIN" --socket "$SOCKET" send base 'printf "ready? "; read answer; printf "answer=%s\n" "$answer"'
 must prompt_wait_ready "$BIN" --socket "$SOCKET" wait base --until "ready?" --timeout 10s
@@ -361,6 +371,7 @@ grep -F "HTTP: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "MCP: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "human attach: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "policy approval: ok" "$ARTIFACTS/report.md" >/dev/null
+grep -F "semantic screen: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "tmux reconnect: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "daemon restart replay: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "fork comparison: ok" "$ARTIFACTS/report.md" >/dev/null

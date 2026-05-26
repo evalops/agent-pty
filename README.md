@@ -62,8 +62,8 @@ agent-pty stop
 ## What Works Now
 
 - Persistent PTY sessions through `portable-pty`.
-- `vt100` screen snapshots with spans for prompts, output, error-looking lines,
-  URLs, and file paths.
+- `vt100` screen snapshots with spans plus semantic summaries for prompts,
+  commands, error lines, URLs, file paths, spinners, and active processes.
 - Predicate waits for literal/regex text, prompt return, idle output, and
   process exit.
 - Append-only JSONL evidence logs for actions and observations.
@@ -99,6 +99,7 @@ agent-pty new --repo ~/src/evalops/platform --name durable-1 --backend tmux
 agent-pty send codex-1 "cargo test"
 agent-pty attach codex-1
 agent-pty screen codex-1 --format markdown
+agent-pty screen codex-1 --format json
 agent-pty wait codex-1 --until "finished in"
 agent-pty wait codex-1 --until "idle:2s"
 agent-pty list
@@ -182,6 +183,18 @@ printf 'yes\n' | agent-pty attach codex-1 --timeout 1s
 Attach uses a streaming Unix-socket handshake, not the one-request/one-response
 JSON protocol. Each attach is recorded as evidence, and any bytes typed through
 the attach channel are logged as normal `send_keys` actions.
+
+## Semantic Screen
+
+`agent-pty screen <name> --format json` returns the raw screen text, spans, and
+a `semantic` summary. The summary is built for agent consumption:
+
+- latest prompt-looking line
+- latest command-looking line
+- error-looking line indexes
+- URLs and file paths
+- spinner-looking line indexes
+- active child process, when visible from the process tree
 
 ## Session Backends
 

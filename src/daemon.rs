@@ -315,6 +315,9 @@ pub fn serve_unix_with_policy(
 
         match listener.accept() {
             Ok((stream, _addr)) => {
+                stream
+                    .set_nonblocking(false)
+                    .context("set unix client stream blocking")?;
                 let manager = Arc::clone(&manager);
                 let shutdown_tx = shutdown_tx.clone();
                 thread::spawn(move || {
@@ -446,14 +449,6 @@ fn handle_attach_stream(
     read_only: bool,
     history_bytes: usize,
 ) -> Result<bool> {
-    if let Err(error) = manager.record_attach(&session_id) {
-        serde_json::to_writer(&mut stream, &WireResponse::error(format!("{error:#}")))
-            .context("serialize attach error response")?;
-        stream
-            .write_all(b"\n")
-            .context("write attach error response newline")?;
-        return Ok(false);
-    }
     let (mut cursor, initial) = match manager.transcript_snapshot(&session_id, history_bytes) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -465,6 +460,14 @@ fn handle_attach_stream(
             return Ok(false);
         }
     };
+    if let Err(error) = manager.record_attach(&session_id) {
+        serde_json::to_writer(&mut stream, &WireResponse::error(format!("{error:#}")))
+            .context("serialize attach error response")?;
+        stream
+            .write_all(b"\n")
+            .context("write attach error response newline")?;
+        return Ok(false);
+    }
     serde_json::to_writer(&mut stream, &WireResponse::ok(ResponsePayload::Attached))
         .context("serialize attach response")?;
     stream
@@ -476,6 +479,7 @@ fn handle_attach_stream(
             .context("write initial attach transcript")?;
         stream.flush().context("flush initial attach transcript")?;
     }
+    let mut last_screen_text = manager.screen(&session_id).ok().map(|screen| screen.text);
 
     stream
         .set_read_timeout(Some(Duration::from_millis(50)))
@@ -499,6 +503,14 @@ fn handle_attach_stream(
 
         let (next_cursor, chunk) = manager.transcript_since(&session_id, cursor)?;
         cursor = next_cursor;
+        let chunk = if chunk.is_empty() {
+            attach_screen_delta(&manager, &session_id, &mut last_screen_text)
+        } else {
+            if let Ok(screen) = manager.screen(&session_id) {
+                last_screen_text = Some(screen.text);
+            }
+            chunk
+        };
         if !chunk.is_empty() {
             if let Err(error) = stream.write_all(chunk.as_bytes()) {
                 if matches!(
@@ -516,4 +528,36 @@ fn handle_attach_stream(
     }
 
     Ok(false)
+}
+
+fn attach_screen_delta(
+    manager: &SessionManager,
+    session_id: &str,
+    last_screen_text: &mut Option<String>,
+) -> String {
+    let Ok(screen) = manager.screen(session_id) else {
+        return String::new();
+    };
+    let current = screen.text;
+    let Some(previous) = last_screen_text.replace(current.clone()) else {
+        return String::new();
+    };
+    screen_delta(&previous, &current)
+}
+
+fn screen_delta(previous: &str, current: &str) -> String {
+    if previous == current {
+        return String::new();
+    }
+    let mut boundary = 0;
+    let mut previous_chars = previous.chars();
+    for (index, current_char) in current.char_indices() {
+        match previous_chars.next() {
+            Some(previous_char) if previous_char == current_char => {
+                boundary = index + current_char.len_utf8();
+            }
+            _ => break,
+        }
+    }
+    current[boundary..].to_string()
 }
