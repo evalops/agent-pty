@@ -77,6 +77,7 @@ agent-pty stop
 - Unix-socket JSON daemon.
 - Daemon lifecycle diagnostics with `doctor`, `status`, and `stop`.
 - Human attach over the Unix socket with live output and optional stdin control.
+- Tmux-backed sessions that can reconnect to live processes after daemon restart.
 - HTTP/JSON request surface.
 - MCP-compatible stdio JSON-RPC tool surface.
 - OTEL-style JSONL trace events for daemon requests.
@@ -94,6 +95,7 @@ agent-pty serve-http --addr 127.0.0.1:4319
 agent-pty mcp-stdio
 
 agent-pty new --repo ~/src/evalops/platform --name codex-1
+agent-pty new --repo ~/src/evalops/platform --name durable-1 --backend tmux
 agent-pty send codex-1 "cargo test"
 agent-pty attach codex-1
 agent-pty screen codex-1 --format markdown
@@ -116,6 +118,7 @@ terminal stream.
 
 ```json
 {"op":"new","id":"codex-1","repo":"/repo","shell":"/bin/sh","rows":24,"cols":80,"env":{}}
+{"op":"new","id":"durable-1","repo":"/repo","shell":"/bin/sh","rows":24,"cols":80,"env":{},"backend":"tmux"}
 {"op":"send","id":"codex-1","text":"cargo test","enter":true}
 {"op":"attach","id":"codex-1","read_only":false,"history_bytes":12000}
 {"op":"wait","id":"codex-1","until":"regex:finished in","timeout_ms":30000}
@@ -177,6 +180,25 @@ printf 'yes\n' | agent-pty attach codex-1 --timeout 1s
 Attach uses a streaming Unix-socket handshake, not the one-request/one-response
 JSON protocol. Each attach is recorded as evidence, and any bytes typed through
 the attach channel are logged as normal `send_keys` actions.
+
+## Session Backends
+
+The default `pty` backend is an in-process portable PTY. It is fast and has the
+most complete local state, but the live process dies with the daemon.
+
+Use `--backend tmux` when a session must survive daemon restarts:
+
+```bash
+agent-pty new --repo "$PWD" --name durable-1 --backend tmux
+agent-pty send durable-1 "npm test -- --watch"
+agent-pty stop
+agent-pty serve --socket ~/.agent-pty.sock
+agent-pty screen durable-1
+```
+
+Tmux-backed sessions are persisted in `sessions.json` with their tmux session
+name. A fresh daemon using the same log directory can reconnect to the live tmux
+session for `send`, `screen`, `wait`, `attach`, `proof`, `replay`, and `kill`.
 
 ## HTTP Transport
 

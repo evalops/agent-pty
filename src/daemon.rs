@@ -62,6 +62,8 @@ pub enum Request {
         rows: u16,
         cols: u16,
         env: BTreeMap<String, String>,
+        #[serde(default)]
+        backend: crate::session::SessionBackend,
     },
     Send {
         id: String,
@@ -174,6 +176,7 @@ fn handle_request_inner(manager: &SessionManager, request: Request) -> Result<Re
             rows,
             cols,
             env,
+            backend,
         } => {
             manager.open(SessionConfig {
                 id: id.clone(),
@@ -182,6 +185,7 @@ fn handle_request_inner(manager: &SessionManager, request: Request) -> Result<Re
                 env,
                 rows,
                 cols,
+                backend,
             })?;
             Ok(ResponsePayload::SessionCreated { id })
         }

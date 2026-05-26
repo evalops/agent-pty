@@ -161,6 +161,7 @@ write_report() {
     echo "- human attach: ok"
     echo "- REPL interaction: ok"
     echo "- long-running logs: ok"
+    echo "- tmux reconnect: ok"
     echo "- daemon restart replay: ok"
     echo "- fork comparison: ok"
     echo "- concurrent evidence access: ok"
@@ -268,6 +269,21 @@ assert_contains "$ARTIFACTS/mcp.out" "terminal.proof"
 assert_contains "$ARTIFACTS/mcp.out" "mcp-e2e-ok"
 record mcp
 
+RECONNECT_ID="tmux-reconnect-$$"
+rm -f "$REPO/tmux-resume.flag"
+must tmux_backend_new "$BIN" --socket "$SOCKET" new --repo "$REPO" --name "$RECONNECT_ID" --shell /bin/sh --backend tmux
+must tmux_backend_send "$BIN" --socket "$SOCKET" send "$RECONNECT_ID" "printf 'tmux-before-restart\n'; (while [ ! -f tmux-resume.flag ]; do sleep 0.1; done; printf 'tmux-after-restart\n') &"
+must tmux_backend_wait_before "$BIN" --socket "$SOCKET" wait "$RECONNECT_ID" --until "tmux-before-restart" --timeout 10s
+tmux respawn-pane -k -t "$DAEMON_PANE" "cd '$ROOT' && '$BIN' --socket '$SOCKET' serve --log-dir '$LOG_DIR' 2>&1 | tee -a '$ARTIFACTS/daemon-pane.log'"
+sleep 1
+wait_socket "$SOCKET"
+printf 'go\n' >"$REPO/tmux-resume.flag"
+must tmux_backend_wait_after "$BIN" --socket "$SOCKET" wait "$RECONNECT_ID" --until "tmux-after-restart" --timeout 10s
+must tmux_backend_send_post "$BIN" --socket "$SOCKET" send "$RECONNECT_ID" "printf 'tmux-post-reconnect\n'"
+must tmux_backend_wait_post "$BIN" --socket "$SOCKET" wait "$RECONNECT_ID" --until "tmux-post-reconnect" --timeout 10s
+must tmux_backend_kill "$BIN" --socket "$SOCKET" kill "$RECONNECT_ID"
+record tmux_reconnect
+
 tmux respawn-pane -k -t "$DAEMON_PANE" "cd '$ROOT' && '$BIN' --socket '$SOCKET' serve --log-dir '$LOG_DIR' 2>&1 | tee -a '$ARTIFACTS/daemon-pane.log'"
 sleep 1
 wait_socket "$SOCKET"
@@ -333,6 +349,7 @@ grep -F "Unix CLI: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "HTTP: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "MCP: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "human attach: ok" "$ARTIFACTS/report.md" >/dev/null
+grep -F "tmux reconnect: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "daemon restart replay: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "fork comparison: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "tests passed" "$ARTIFACTS/proofs/fix-a.proof.md" >/dev/null
