@@ -74,6 +74,8 @@ CLI daemon control, HTTP/JSON, and MCP stdio flows against real sessions.
 - Predicate waits for literal/regex text, prompt return, idle output, and
   process exit.
 - Append-only JSONL evidence logs for actions and observations.
+- Evidence redaction for common token/password/API-key shapes before JSONL write.
+- SHA-256 event hash chains with proof-level log-integrity reporting.
 - Git status/diff snapshots around mutating actions.
 - Durable session index with workspace, shell, env, pid, dimensions, start time,
   active state, and event-log path.
@@ -265,8 +267,13 @@ summarizes:
 - approved policy actions
 - nonzero exits
 - screen tail
+- log-integrity status
 - event-log path
 - generated JSON, Markdown, and HTML artifact paths
+
+Before events are written, common secret-like values are redacted from commands,
+observations, and git snapshots. Each event is linked into a SHA-256 hash chain;
+proof bundles report whether the replayed log verifies.
 
 `agent-pty proof <name>` prints the Markdown proof path by default.
 `agent-pty proof <name> --html` prints the browser-friendly HTML proof path, and

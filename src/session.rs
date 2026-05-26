@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    evidence::{Action, EventLog, EvidenceEvent, FileChange, GitSnapshot, Observation, Predicate},
+    evidence::{
+        Action, EventLog, EvidenceEvent, FileChange, GitSnapshot, LogIntegrity, Observation,
+        Predicate,
+    },
     policy::{
         ActionPolicy, PolicyAction, PolicyApprovalGrant, PolicyApprovalRecord, approval_expiry,
     },
@@ -86,6 +89,7 @@ pub struct ProofBundle {
     pub latest_git_status: Option<String>,
     pub git_diff: Option<String>,
     pub screen_tail: String,
+    pub log_integrity: LogIntegrity,
     pub log_path: PathBuf,
     pub json_path: PathBuf,
     pub markdown_path: PathBuf,
@@ -796,7 +800,9 @@ impl SessionManager {
     }
 
     pub fn proof(&self, session_id: &str) -> Result<ProofBundle> {
-        let events = self.replay(session_id)?;
+        let log = EventLog::open(self.log_path(session_id))?;
+        let events = log.replay()?;
+        let log_integrity = log.verify_integrity()?;
         let mut commands_run = Vec::new();
         let mut files_changed = BTreeMap::<PathBuf, FileChange>::new();
         let mut risk_flags = BTreeSet::<String>::new();
@@ -873,6 +879,7 @@ impl SessionManager {
             latest_git_status,
             git_diff,
             screen_tail,
+            log_integrity,
             log_path: self.log_path(session_id),
             json_path,
             markdown_path,
@@ -1721,6 +1728,17 @@ fn render_proof_markdown(proof: &ProofBundle) -> String {
     output.push_str(&format!("# agent-pty proof: {}\n\n", proof.session_id));
     output.push_str(&format!("- Generated: {}\n", proof.generated_at));
     output.push_str(&format!("- Events: {}\n", proof.event_count));
+    output.push_str(&format!(
+        "- Log integrity: {}\n",
+        if proof.log_integrity.verified {
+            "verified"
+        } else {
+            "failed"
+        }
+    ));
+    if let Some(error) = &proof.log_integrity.first_error {
+        output.push_str(&format!("- Integrity error: {error}\n"));
+    }
     output.push_str(&format!("- Event log: `{}`\n", proof.log_path.display()));
     output.push_str(&format!("- HTML: `{}`\n", proof.html_path.display()));
     output.push_str("\n## Commands\n\n");
@@ -1804,6 +1822,18 @@ fn render_proof_html(proof: &ProofBundle) -> String {
         .as_deref()
         .filter(|diff| !diff.trim().is_empty())
         .unwrap_or("no diff recorded");
+    let integrity_status = if proof.log_integrity.verified {
+        "verified".to_string()
+    } else {
+        format!(
+            "failed: {}",
+            proof
+                .log_integrity
+                .first_error
+                .as_deref()
+                .unwrap_or("unknown integrity error")
+        )
+    };
 
     format!(
         r#"<!doctype html>
@@ -1844,6 +1874,7 @@ fn render_proof_html(proof: &ProofBundle) -> String {
     <div class="meta">
       <div><strong>Generated</strong><br>{generated}</div>
       <div><strong>Events</strong><br>{event_count}</div>
+      <div><strong>Log integrity</strong><br>{integrity_status}</div>
       <div><strong>Event log</strong><br><code>{log_path}</code></div>
       <div><strong>JSON</strong><br><code>{json_path}</code></div>
       <div><strong>Markdown</strong><br><code>{markdown_path}</code></div>
@@ -1889,6 +1920,7 @@ fn render_proof_html(proof: &ProofBundle) -> String {
         session = html_escape(&proof.session_id),
         generated = html_escape(&proof.generated_at.to_string()),
         event_count = proof.event_count,
+        integrity_status = html_escape(&integrity_status),
         log_path = html_escape(&proof.log_path.display().to_string()),
         json_path = html_escape(&proof.json_path.display().to_string()),
         markdown_path = html_escape(&proof.markdown_path.display().to_string()),
