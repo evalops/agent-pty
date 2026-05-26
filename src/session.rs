@@ -270,8 +270,17 @@ impl SessionManager {
     }
 
     pub fn replay(&self, session_id: &str) -> Result<Vec<EvidenceEvent>> {
-        let handle = self.handle(session_id)?;
-        handle.log.replay()
+        if let Some(handle) = self
+            .sessions
+            .lock()
+            .expect("session registry lock poisoned")
+            .get(session_id)
+            .cloned()
+        {
+            return handle.log.replay();
+        }
+
+        EventLog::open(self.log_path(session_id))?.replay()
     }
 
     fn observation_from(&self, handle: &SessionHandle) -> SessionObservation {
