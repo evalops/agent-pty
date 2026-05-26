@@ -60,6 +60,9 @@ agent-pty kill first-run
 agent-pty stop
 ```
 
+For ready-to-run integration examples, see [`examples/`](examples/). They cover
+CLI daemon control, HTTP/JSON, and MCP stdio flows against real sessions.
+
 ## What Works Now
 
 - Persistent PTY sessions through `portable-pty`.
