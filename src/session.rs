@@ -141,6 +141,18 @@ pub struct ScreenSnapshot {
     pub cols: u16,
     pub text: String,
     pub spans: Vec<ScreenSpan>,
+    pub semantic: Box<ScreenSemantics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScreenSemantics {
+    pub prompt: Option<String>,
+    pub command: Option<String>,
+    pub error_lines: Vec<usize>,
+    pub urls: Vec<String>,
+    pub file_paths: Vec<String>,
+    pub spinner_lines: Vec<usize>,
+    pub active_process: Option<ProcessInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,11 +435,16 @@ impl SessionManager {
                 return Err(handle_error);
             }
         };
-        Ok(handle
+        let mut screen = handle
             .state
             .lock()
             .expect("session state lock poisoned")
-            .screen_snapshot())
+            .screen_snapshot();
+        screen.semantic.active_process = handle
+            .process_id
+            .and_then(process_snapshot)
+            .and_then(active_process);
+        Ok(screen)
     }
 
     pub fn transcript_snapshot(
@@ -959,6 +976,16 @@ impl SessionManager {
             rows: metadata.rows,
             cols: metadata.cols,
             spans: spans_for_screen(&text),
+            semantic: Box::new(
+                semantics_for_screen(&text).with_active_process(
+                    metadata
+                        .tmux_session
+                        .as_deref()
+                        .and_then(tmux_root_pid)
+                        .and_then(process_snapshot)
+                        .and_then(active_process),
+                ),
+            ),
             text,
         })
     }
@@ -1320,6 +1347,7 @@ impl SessionState {
             rows: self.rows,
             cols: self.cols,
             spans: spans_for_screen(&text),
+            semantic: Box::new(semantics_for_screen(&text)),
             text,
         }
     }
@@ -1427,6 +1455,13 @@ impl SessionObservation {
     }
 }
 
+impl ScreenSemantics {
+    fn with_active_process(mut self, active_process: Option<ProcessInfo>) -> Self {
+        self.active_process = active_process;
+        self
+    }
+}
+
 fn spans_for_screen(text: &str) -> Vec<ScreenSpan> {
     let mut spans = Vec::new();
     for (line_index, line) in text.lines().enumerate() {
@@ -1472,6 +1507,78 @@ fn spans_for_screen(text: &str) -> Vec<ScreenSpan> {
         }
     }
     spans
+}
+
+fn semantics_for_screen(text: &str) -> ScreenSemantics {
+    let mut semantic = ScreenSemantics::default();
+    for (line_index, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if looks_like_prompt(line) {
+            semantic.prompt = Some(trimmed.to_string());
+        }
+        if let Some(command) = command_after_prompt(line) {
+            semantic.command = Some(command.to_string());
+        }
+        if looks_error_like(line) {
+            semantic.error_lines.push(line_index);
+        }
+        if looks_like_spinner(line) {
+            semantic.spinner_lines.push(line_index);
+        }
+        for match_ in URL_RE.find_iter(line) {
+            push_unique(&mut semantic.urls, match_.as_str());
+        }
+        for match_ in FILE_PATH_RE.find_iter(line) {
+            push_unique(&mut semantic.file_paths, match_.as_str());
+        }
+    }
+    semantic
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|existing| existing == value) {
+        values.push(value.to_string());
+    }
+}
+
+fn command_after_prompt(line: &str) -> Option<&str> {
+    ["$ ", "% ", "# ", "> "]
+        .iter()
+        .filter_map(|marker| line.rfind(marker).map(|index| index + marker.len()))
+        .filter_map(|start| {
+            let command = line[start..].trim();
+            (!command.is_empty()).then_some(command)
+        })
+        .next()
+}
+
+fn looks_like_spinner(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    (lower.contains("running") || lower.contains("loading") || lower.contains("waiting"))
+        && (lower.contains("...") || lower.contains(" - ") || lower.contains(" | "))
+}
+
+fn active_process(snapshot: ProcessSnapshot) -> Option<ProcessInfo> {
+    snapshot.processes.into_iter().rev().find(|process| {
+        process.pid != snapshot.root_pid
+            && !process.command.contains("agent-pty")
+            && !looks_like_shell_process(&process.command)
+    })
+}
+
+fn looks_like_shell_process(command: &str) -> bool {
+    let command = command.trim();
+    command == "sh"
+        || command == "-sh"
+        || command.ends_with("/sh")
+        || command.ends_with(" bash")
+        || command.ends_with("/bash")
+        || command.ends_with(" zsh")
+        || command.ends_with("/zsh")
 }
 
 fn looks_error_like(line: &str) -> bool {

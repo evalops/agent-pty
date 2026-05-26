@@ -134,7 +134,7 @@ fn run_reconnect_flow(socket: &Path, log_dir: &Path, workspace: &Path) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("attach to reconnected tmux session");
-    thread::sleep(Duration::from_millis(150));
+    wait_for_attach_event(socket, "agent-pty-reconnect");
     run_ok(
         Command::new(agent_pty_bin())
             .arg("--socket")
@@ -158,6 +158,31 @@ fn run_reconnect_flow(socket: &Path, log_dir: &Path, workspace: &Path) {
     );
 
     cleanup_daemon(&mut daemon, socket);
+}
+
+fn wait_for_attach_event(socket: &Path, session_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_stdout = String::new();
+    let mut last_stderr = String::new();
+    while Instant::now() < deadline {
+        let output = Command::new(agent_pty_bin())
+            .arg("--socket")
+            .arg(socket)
+            .arg("replay")
+            .arg(session_id)
+            .output()
+            .expect("replay attach evidence");
+        last_stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        last_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if output.status.success() && last_stdout.contains("attach human") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "attach evidence was not recorded\nstdout:\n{}\nstderr:\n{}",
+        last_stdout, last_stderr
+    );
 }
 
 fn start_daemon(socket: &Path, log_dir: &Path) -> Child {
