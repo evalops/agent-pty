@@ -1,4 +1,4 @@
-use std::{fs, process::Command};
+use std::{fs, process::Command, sync::Arc, thread};
 
 use agent_pty::evidence::{Action, EventKind, EventLog, GitSnapshot, Observation};
 use tempfile::TempDir;
@@ -67,6 +67,35 @@ fn git_snapshot_reports_status_and_diff_for_a_dirty_repo() {
     assert!(!snapshot.clean);
     assert!(snapshot.status_short.contains("M README.md"));
     assert!(snapshot.diff.contains("+world"));
+}
+
+#[test]
+fn event_log_handles_concurrent_appenders_without_corrupting_jsonl() {
+    let temp = TempDir::new().unwrap();
+    let log = Arc::new(EventLog::open(temp.path().join("run.jsonl")).unwrap());
+
+    let threads = (0..32)
+        .map(|index| {
+            let log = Arc::clone(&log);
+            thread::spawn(move || {
+                log.append_action(
+                    "concurrent",
+                    Action::SendKeys {
+                        bytes: format!("echo {index}\n").into_bytes(),
+                    },
+                    None,
+                )
+                .unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        thread.join().unwrap();
+    }
+
+    let events = log.replay().unwrap();
+    assert_eq!(events.len(), 32);
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) {

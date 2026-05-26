@@ -3,6 +3,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 
@@ -10,6 +11,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+static EVENT_LOG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone)]
 pub struct EventLog {
@@ -83,6 +86,9 @@ impl EventLog {
     }
 
     fn append(&self, event: EvidenceEvent) -> Result<EvidenceEvent> {
+        let _guard = EVENT_LOG_WRITE_LOCK
+            .lock()
+            .expect("event log write lock poisoned");
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
