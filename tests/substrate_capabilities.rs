@@ -61,11 +61,16 @@ fn manager_persists_session_metadata_and_writes_proof_bundle() {
     assert!(proof.event_count >= 4);
     assert!(proof.json_path.exists());
     assert!(proof.markdown_path.exists());
+    assert!(proof.html_path.exists());
     assert!(
         fs::read_to_string(&proof.markdown_path)
             .unwrap()
             .contains("proof-ok")
     );
+    let html = fs::read_to_string(&proof.html_path).unwrap();
+    assert!(html.contains("agent-pty proof: proofy"));
+    assert!(html.contains("proof-ok"));
+    assert!(html.contains("Commands Run"));
 
     let observation = manager
         .wait(

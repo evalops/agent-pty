@@ -38,6 +38,9 @@ fn tmux_black_box_harness_exercises_agent_pty_end_to_end() {
     assert!(proof.contains("cargo test"));
     assert!(proof.contains("test result: ok"));
     assert!(proof.contains("tests passed"));
+    let proof_html = fs::read_to_string(artifacts.join("proofs/fix-a.proof.html")).unwrap();
+    assert!(proof_html.contains("agent-pty proof: fix-a"));
+    assert!(proof_html.contains("Commands Run"));
 
     let capture = fs::read_to_string(artifacts.join("tmux-driver-pane.txt")).unwrap();
     assert!(capture.contains("agent-pty-e2e-complete"));

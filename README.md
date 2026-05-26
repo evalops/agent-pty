@@ -29,7 +29,7 @@ for the passing check, and writes proof artifacts. The output points to:
 
 - the demo workspace
 - a Markdown report
-- the generated proof bundle
+- generated proof bundle artifacts in JSON, Markdown, and HTML
 - the append-only event log
 
 For automation, use JSON output:
@@ -55,6 +55,7 @@ agent-pty wait first-run --until "hello from agent-pty"
 agent-pty screen first-run --format markdown
 agent-pty attach first-run --read-only --timeout 2s
 agent-pty proof first-run
+agent-pty proof first-run --html
 agent-pty kill first-run
 agent-pty stop
 ```
@@ -71,7 +72,7 @@ agent-pty stop
 - Durable session index with workspace, shell, env, pid, dimensions, start time,
   active state, and event-log path.
 - Process snapshots in observations, including root pid and child processes.
-- Proof bundles as JSON and Markdown artifacts.
+- Proof bundles as JSON, Markdown, and self-contained HTML artifacts.
 - Git worktree-backed forks for parallel repair attempts.
 - Configurable policy gate with audited denials and one-time approval tokens.
 - Unix-socket JSON daemon.
@@ -104,6 +105,7 @@ agent-pty wait codex-1 --until "finished in"
 agent-pty wait codex-1 --until "idle:2s"
 agent-pty list
 agent-pty proof codex-1
+agent-pty proof codex-1 --html
 agent-pty replay codex-1 --json
 agent-pty fork codex-1 --new-name repair-b --copy-worktree
 agent-pty trace-path
@@ -258,7 +260,11 @@ summarizes:
 - nonzero exits
 - screen tail
 - event-log path
-- generated JSON and Markdown artifact paths
+- generated JSON, Markdown, and HTML artifact paths
+
+`agent-pty proof <name>` prints the Markdown proof path by default.
+`agent-pty proof <name> --html` prints the browser-friendly HTML proof path, and
+`agent-pty proof <name> --json` returns the full structured bundle.
 
 ## Policy Gate
 
@@ -365,6 +371,7 @@ Artifacts are written under `target/e2e-tmux/latest`:
 - `agent-pty-logs/*.jsonl`
 - `agent-pty-logs/traces.jsonl`
 - `proofs/*.proof.md`
+- `proofs/*.proof.html`
 
 This harness is intentionally slower and more operationally realistic than the
 normal Cargo suite. It is the check to run before claiming that terminal,

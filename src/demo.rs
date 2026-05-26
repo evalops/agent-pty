@@ -30,6 +30,7 @@ pub struct DemoSummary {
     pub event_log_path: PathBuf,
     pub proof_json_path: PathBuf,
     pub proof_markdown_path: PathBuf,
+    pub proof_html_path: PathBuf,
     pub report_path: PathBuf,
     pub screen_tail: String,
 }
@@ -72,7 +73,7 @@ pub fn run_demo(options: DemoOptions) -> Result<DemoSummary> {
     let report_path = run_dir.join("demo-report.md");
     fs::write(
         &report_path,
-        render_demo_report(&proof.screen_tail, &proof.markdown_path),
+        render_demo_report(&proof.screen_tail, &proof.markdown_path, &proof.html_path),
     )
     .with_context(|| format!("write demo report {}", report_path.display()))?;
 
@@ -85,6 +86,7 @@ pub fn run_demo(options: DemoOptions) -> Result<DemoSummary> {
         event_log_path: proof.log_path,
         proof_json_path: proof.json_path,
         proof_markdown_path: proof.markdown_path,
+        proof_html_path: proof.html_path,
         report_path,
         screen_tail: proof.screen_tail,
     })
@@ -176,10 +178,11 @@ fn run_git(workspace: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn render_demo_report(screen_tail: &str, proof_path: &Path) -> String {
+fn render_demo_report(screen_tail: &str, proof_path: &Path, proof_html_path: &Path) -> String {
     format!(
-        "# agent-pty demo\n\nagent-pty demo complete\n\n- proof: {}\n\n## Screen Tail\n\n```text\n{}\n```\n",
+        "# agent-pty demo\n\nagent-pty demo complete\n\n- proof: {}\n- proof html: {}\n\n## Screen Tail\n\n```text\n{}\n```\n",
         proof_path.display(),
+        proof_html_path.display(),
         screen_tail.trim_end()
     )
 }

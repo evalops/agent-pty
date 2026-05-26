@@ -185,6 +185,7 @@ pub enum Action {
     Proof {
         json_path: PathBuf,
         markdown_path: PathBuf,
+        html_path: PathBuf,
     },
 }
 
