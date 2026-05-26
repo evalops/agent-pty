@@ -330,6 +330,19 @@ touch "$ARTIFACTS/done"
 DRIVER
 chmod +x "$DRIVER"
 
+DRIVER_RUNNER="$ARTIFACTS/run-driver-with-typescript.sh"
+cat >"$DRIVER_RUNNER" <<'RUNNER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if script --version >/dev/null 2>&1; then
+  exec script -q -c "$DRIVER" "$ARTIFACTS/driver.typescript"
+fi
+
+exec script -q "$ARTIFACTS/driver.typescript" "$DRIVER"
+RUNNER
+chmod +x "$DRIVER_RUNNER"
+
 cleanup() {
   tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
 }
@@ -345,7 +358,7 @@ tmux set-window-option -t "$SESSION" remain-on-exit on >/dev/null
 DAEMON_PANE="$(tmux display-message -p -t "$SESSION:daemon" '#{pane_id}')"
 HTTP_PANE="$(tmux split-window -P -F '#{pane_id}' -t "$SESSION:daemon" -h "cd '$ROOT' && '$BIN' serve-http --addr '$HTTP_ADDR' --log-dir '$HTTP_LOG_DIR' 2>&1 | tee '$ARTIFACTS/http-pane.log'")"
 OBSERVER_PANE="$(tmux new-window -P -F '#{pane_id}' -t "$SESSION" -n observer "for i in \$(seq 1 $TIMEOUT_SECONDS); do date; '$BIN' --socket '$SOCKET' list || true; [ -f '$ARTIFACTS/done' ] && break; sleep 1; done 2>&1 | tee '$ARTIFACTS/observer-pane.log'")"
-DRIVER_PANE="$(tmux new-window -P -F '#{pane_id}' -t "$SESSION" -n driver "env ROOT='$ROOT' BIN='$BIN' ARTIFACTS='$ARTIFACTS' REPO='$REPO' LOG_DIR='$LOG_DIR' MCP_LOG_DIR='$MCP_LOG_DIR' SOCKET='$SOCKET' HTTP_URL='$HTTP_URL' DAEMON_PANE='$DAEMON_PANE' script -q '$ARTIFACTS/driver.typescript' '$DRIVER'; echo driver-pane-held-for-capture; while [ ! -f '$ARTIFACTS/cleanup' ]; do sleep 1; done")"
+DRIVER_PANE="$(tmux new-window -P -F '#{pane_id}' -t "$SESSION" -n driver "env ROOT='$ROOT' BIN='$BIN' ARTIFACTS='$ARTIFACTS' REPO='$REPO' LOG_DIR='$LOG_DIR' MCP_LOG_DIR='$MCP_LOG_DIR' SOCKET='$SOCKET' HTTP_URL='$HTTP_URL' DAEMON_PANE='$DAEMON_PANE' DRIVER='$DRIVER' '$DRIVER_RUNNER'; echo driver-pane-held-for-capture; while [ ! -f '$ARTIFACTS/cleanup' ]; do sleep 1; done")"
 
 for _ in $(seq 1 "$TIMEOUT_SECONDS"); do
   if [[ -f "$ARTIFACTS/done" ]]; then

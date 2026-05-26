@@ -9,7 +9,6 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -64,7 +63,7 @@ impl EventLog {
             .read(true)
             .open(&self.path)
             .with_context(|| format!("open event log {}", self.path.display()))?;
-        file.lock_shared()
+        fs2::FileExt::lock_shared(&file)
             .with_context(|| format!("lock event log {}", self.path.display()))?;
         let reader = BufReader::new(file);
         let mut events = Vec::new();
@@ -97,7 +96,7 @@ impl EventLog {
             .append(true)
             .open(&self.path)
             .with_context(|| format!("open event log {}", self.path.display()))?;
-        file.lock_exclusive()
+        fs2::FileExt::lock_exclusive(&file)
             .with_context(|| format!("lock event log {}", self.path.display()))?;
         let mut line = serde_json::to_vec(&event)
             .with_context(|| format!("serialize event for {}", event.session_id))?;
