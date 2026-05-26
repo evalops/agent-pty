@@ -166,6 +166,17 @@ pub enum Action {
         command: String,
         rule: String,
     },
+    PolicyApprovalCreated {
+        command: String,
+        rule: String,
+        approval_id: String,
+        expires_at: DateTime<Utc>,
+    },
+    PolicyApproved {
+        command: String,
+        rule: String,
+        approval_id: String,
+    },
     Fork {
         source: String,
         target: String,

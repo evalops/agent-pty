@@ -14,11 +14,15 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use agent_pty::{
-    daemon::{Request, ResponsePayload, WireResponse, parse_duration, request_unix, serve_unix},
+    daemon::{
+        Request, ResponsePayload, WireResponse, parse_duration, request_unix,
+        serve_unix_with_policy,
+    },
     demo::{DemoOptions, run_demo},
     evidence::{Action, EventKind},
     http::serve_http,
     mcp::serve_mcp_stdio,
+    policy::ActionPolicy,
     session::SessionBackend,
 };
 
@@ -39,6 +43,9 @@ enum Command {
     Serve {
         #[arg(long, default_value = "~/.agent-pty/runs")]
         log_dir: PathBuf,
+        /// JSON policy file for command gates.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
     /// Start the HTTP/JSON daemon.
     ServeHttp {
@@ -46,11 +53,17 @@ enum Command {
         addr: String,
         #[arg(long, default_value = "~/.agent-pty/runs")]
         log_dir: PathBuf,
+        /// JSON policy file for command gates.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
     /// Serve MCP-compatible terminal tools over stdio JSON-RPC.
     McpStdio {
         #[arg(long, default_value = "~/.agent-pty/runs")]
         log_dir: PathBuf,
+        /// JSON policy file for command gates.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
     /// Run a self-contained five-minute demo and emit proof artifacts.
     Demo {
@@ -113,6 +126,20 @@ enum Command {
         /// Send bytes without appending Enter.
         #[arg(long)]
         no_enter: bool,
+        /// One-time policy approval token for this exact command.
+        #[arg(long)]
+        approval: Option<String>,
+    },
+    /// Create a one-time approval token for a policy-gated command.
+    Approve {
+        name: String,
+        command: String,
+        /// Expected policy rule label, used as a guard against approving the wrong rule.
+        #[arg(long)]
+        rule: Option<String>,
+        /// Approval time-to-live.
+        #[arg(long, default_value = "10m")]
+        ttl: String,
     },
     /// Attach this terminal to a live session over the Unix socket.
     Attach {
@@ -210,17 +237,25 @@ fn run() -> Result<()> {
     let socket = expand_tilde(cli.socket);
 
     match cli.command {
-        Command::Serve { log_dir } => {
+        Command::Serve { log_dir, policy } => {
             let log_dir = expand_tilde(log_dir);
+            let policy = load_policy(policy)?;
             println!("agent-pty listening on {}", socket.display());
-            serve_unix(socket, log_dir)
+            serve_unix_with_policy(socket, log_dir, policy)
         }
-        Command::ServeHttp { addr, log_dir } => {
+        Command::ServeHttp {
+            addr,
+            log_dir,
+            policy,
+        } => {
             let log_dir = expand_tilde(log_dir);
+            let policy = load_policy(policy)?;
             println!("agent-pty HTTP listening on {addr}");
-            serve_http(addr, log_dir)
+            serve_http(addr, log_dir, policy)
         }
-        Command::McpStdio { log_dir } => serve_mcp_stdio(expand_tilde(log_dir)),
+        Command::McpStdio { log_dir, policy } => {
+            serve_mcp_stdio(expand_tilde(log_dir), load_policy(policy)?)
+        }
         Command::Demo {
             root,
             name,
@@ -327,6 +362,7 @@ fn run() -> Result<()> {
             name,
             text,
             no_enter,
+            approval,
         } => {
             let payload = request_unix(
                 socket,
@@ -334,6 +370,27 @@ fn run() -> Result<()> {
                     id: name,
                     text,
                     enter: !no_enter,
+                    approval,
+                },
+            )?;
+            print_payload(payload, OutputFormat::Text, false)
+        }
+        Command::Approve {
+            name,
+            command,
+            rule,
+            ttl,
+        } => {
+            let ttl = parse_duration(&ttl)
+                .with_context(|| format!("invalid approval ttl {ttl:?}"))?
+                .as_millis() as u64;
+            let payload = request_unix(
+                socket,
+                &Request::Approve {
+                    id: name,
+                    command,
+                    rule,
+                    ttl_ms: ttl,
                 },
             )?;
             print_payload(payload, OutputFormat::Text, false)
@@ -469,6 +526,13 @@ fn print_payload(payload: ResponsePayload, format: OutputFormat, force_json: boo
                 fork.workspace.display()
             );
         }
+        ResponsePayload::PolicyApproval(approval) => {
+            if format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&approval)?);
+            } else {
+                println!("{}", approval.token);
+            }
+        }
         ResponsePayload::TracePath(path) => println!("{}", path.display()),
         ResponsePayload::Shutdown => println!("stopped"),
         ResponsePayload::Attached => println!("attached"),
@@ -500,6 +564,13 @@ fn print_payload(payload: ResponsePayload, format: OutputFormat, force_json: boo
         }
     }
     Ok(())
+}
+
+fn load_policy(path: Option<PathBuf>) -> Result<ActionPolicy> {
+    match path {
+        Some(path) => ActionPolicy::from_path(expand_tilde(path)),
+        None => Ok(ActionPolicy::default()),
+    }
 }
 
 fn attach_unix(
@@ -784,6 +855,17 @@ fn event_label(kind: &EventKind) -> String {
             Action::PolicyDenied { command, rule } => {
                 format!("policy denied {rule}: {command}")
             }
+            Action::PolicyApprovalCreated {
+                command,
+                rule,
+                approval_id,
+                ..
+            } => format!("policy approval created {approval_id} {rule}: {command}"),
+            Action::PolicyApproved {
+                command,
+                rule,
+                approval_id,
+            } => format!("policy approved {approval_id} {rule}: {command}"),
             Action::Fork {
                 source,
                 target,

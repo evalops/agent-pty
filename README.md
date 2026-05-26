@@ -73,7 +73,7 @@ agent-pty stop
 - Process snapshots in observations, including root pid and child processes.
 - Proof bundles as JSON and Markdown artifacts.
 - Git worktree-backed forks for parallel repair attempts.
-- Initial policy gate with audited denial events.
+- Configurable policy gate with audited denials and one-time approval tokens.
 - Unix-socket JSON daemon.
 - Daemon lifecycle diagnostics with `doctor`, `status`, and `stop`.
 - Human attach over the Unix socket with live output and optional stdin control.
@@ -120,6 +120,8 @@ terminal stream.
 {"op":"new","id":"codex-1","repo":"/repo","shell":"/bin/sh","rows":24,"cols":80,"env":{}}
 {"op":"new","id":"durable-1","repo":"/repo","shell":"/bin/sh","rows":24,"cols":80,"env":{},"backend":"tmux"}
 {"op":"send","id":"codex-1","text":"cargo test","enter":true}
+{"op":"approve","id":"codex-1","command":"printf 'ok\\n' # vault write","rule":"vault write","ttl_ms":600000}
+{"op":"send","id":"codex-1","text":"printf 'ok\\n' # vault write","enter":true,"approval":"<token>"}
 {"op":"attach","id":"codex-1","read_only":false,"history_bytes":12000}
 {"op":"wait","id":"codex-1","until":"regex:finished in","timeout_ms":30000}
 {"op":"screen","id":"codex-1"}
@@ -228,6 +230,7 @@ Responses use the same envelope as the Unix socket transport:
 - `terminal.list`
 - `terminal.proof`
 - `terminal.fork`
+- `terminal.approve`
 
 ## Evidence Model
 
@@ -238,6 +241,7 @@ summarizes:
 - files changed
 - latest git status and diff
 - blocked policy actions
+- approved policy actions
 - nonzero exits
 - screen tail
 - event-log path
@@ -245,8 +249,8 @@ summarizes:
 
 ## Policy Gate
 
-The built-in policy blocks and audits these high-risk command families before
-they reach the PTY:
+The built-in policy requires approval for these high-risk command families
+before they reach the PTY:
 
 - `rm -rf`
 - `git push --force`
@@ -255,8 +259,47 @@ they reach the PTY:
 - `vault write`
 - `gh pr merge`
 
-Policy denials become evidence events, so a run can prove that a dangerous
-mutation was avoided rather than silently skipped.
+Policy denials and approvals become evidence events, so a run can prove that a
+dangerous mutation was avoided, explicitly approved, or blocked by policy.
+
+Create a one-time approval for the exact command, then spend it on `send`:
+
+```bash
+cmd="printf 'approved\n' # vault write"
+token="$(agent-pty approve codex-1 "$cmd" --rule "vault write" --ttl 10m)"
+agent-pty send codex-1 "$cmd" --approval "$token"
+```
+
+Daemon surfaces can load JSON policy files with `--policy`:
+
+```bash
+agent-pty serve --policy ./agent-pty-policy.json
+agent-pty serve-http --policy ./agent-pty-policy.json
+agent-pty mcp-stdio --policy ./agent-pty-policy.json
+```
+
+Example policy:
+
+```json
+{
+  "builtin_rules": true,
+  "rules": [
+    {
+      "label": "block secret writes",
+      "pattern": "(?i)secret-token",
+      "action": "deny"
+    },
+    {
+      "label": "allow tmp cleanup",
+      "pattern": "rm -rf /tmp/agent-pty-safe",
+      "action": "allow"
+    }
+  ]
+}
+```
+
+Rule actions are `allow`, `require_approval`, or `deny`. Custom rules are
+evaluated before built-ins, which lets a policy create tightly scoped exceptions.
 
 ## Local Verification
 

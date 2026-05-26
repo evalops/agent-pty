@@ -87,6 +87,13 @@ fn mcp_stdio_handler_exposes_terminal_tools_and_proof() {
             .iter()
             .any(|tool| tool["name"] == "terminal.proof")
     );
+    assert!(
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "terminal.approve")
+    );
 
     handle_mcp_message(
         &manager,
@@ -146,11 +153,70 @@ fn mcp_stdio_handler_exposes_terminal_tools_and_proof() {
     .unwrap();
     assert!(waited.to_string().contains("mcp-ok"));
 
-    let proof = handle_mcp_message(
+    let approved_command = "printf 'mcp-approved\\n' # vault write";
+    let approval = handle_mcp_message(
         &manager,
         json!({
             "jsonrpc": "2.0",
             "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "terminal.approve",
+                "arguments": {
+                    "id": "mcpty",
+                    "command": approved_command,
+                    "rule": "vault write",
+                    "ttl_ms": 60000
+                }
+            }
+        }),
+    )
+    .unwrap();
+    let token = approval["result"]["structuredContent"]["data"]["token"]
+        .as_str()
+        .unwrap();
+    handle_mcp_message(
+        &manager,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "terminal.send",
+                "arguments": {
+                    "id": "mcpty",
+                    "text": approved_command,
+                    "enter": true,
+                    "approval": token
+                }
+            }
+        }),
+    )
+    .unwrap();
+    let approved = handle_mcp_message(
+        &manager,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "terminal.wait",
+                "arguments": {
+                    "id": "mcpty",
+                    "until": "mcp-approved",
+                    "timeout_ms": 3000
+                }
+            }
+        }),
+    )
+    .unwrap();
+    assert!(approved.to_string().contains("mcp-approved"));
+
+    let proof = handle_mcp_message(
+        &manager,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
             "method": "tools/call",
             "params": {
                 "name": "terminal.proof",

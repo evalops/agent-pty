@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::{
     daemon::{Request, ResponsePayload, handle_request},
+    policy::ActionPolicy,
     session::{SessionBackend, SessionManager},
 };
 
@@ -57,8 +58,8 @@ pub fn handle_mcp_message(manager: &SessionManager, message: Value) -> Result<Va
     }))
 }
 
-pub fn serve_mcp_stdio(log_dir: impl Into<PathBuf>) -> Result<()> {
-    let manager = SessionManager::new(log_dir)?;
+pub fn serve_mcp_stdio(log_dir: impl Into<PathBuf>, policy: ActionPolicy) -> Result<()> {
+    let manager = SessionManager::new_with_policy(log_dir, policy)?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -103,6 +104,7 @@ fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -> Result<R
             id: string_arg(&arguments, "id")?,
             text: string_arg(&arguments, "text")?,
             enter: bool_arg(&arguments, "enter", true),
+            approval: optional_string_arg(&arguments, "approval"),
         },
         "terminal.screen" => Request::Screen {
             id: string_arg(&arguments, "id")?,
@@ -127,6 +129,12 @@ fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -> Result<R
             name: string_arg(&arguments, "name")?,
             copy_worktree: bool_arg(&arguments, "copy_worktree", false),
         },
+        "terminal.approve" => Request::Approve {
+            id: string_arg(&arguments, "id")?,
+            command: string_arg(&arguments, "command")?,
+            rule: optional_string_arg(&arguments, "rule"),
+            ttl_ms: u64_arg(&arguments, "ttl_ms", 600_000)?,
+        },
         _ => bail!("unknown MCP tool {name}"),
     };
     handle_request(manager, request)
@@ -143,6 +151,7 @@ fn tool_descriptors() -> Vec<Value> {
         "terminal.list",
         "terminal.proof",
         "terminal.fork",
+        "terminal.approve",
     ]
     .into_iter()
     .map(|name| {
@@ -161,6 +170,13 @@ fn string_arg(arguments: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .with_context(|| format!("missing string argument {key}"))
+}
+
+fn optional_string_arg(arguments: &Value, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn path_arg(arguments: &Value, key: &str) -> Result<PathBuf> {

@@ -157,6 +157,7 @@ write_report() {
     echo "- MCP: ok"
     echo "- tmux capture: ok"
     echo "- policy denial: ok"
+    echo "- policy approval: ok"
     echo "- prompt interaction: ok"
     echo "- human attach: ok"
     echo "- REPL interaction: ok"
@@ -183,6 +184,16 @@ assert_contains "$ARTIFACTS/policy_denial.out" "vault write requires approval"
 must policy_replay "$BIN" --socket "$SOCKET" replay base
 assert_contains "$ARTIFACTS/policy_replay.out" "policy denied vault write"
 record policy
+
+APPROVED_POLICY_CMD="printf 'approved-policy\n' # vault write"
+must policy_approval "$BIN" --socket "$SOCKET" approve base "$APPROVED_POLICY_CMD" --rule "vault write" --ttl 2m
+APPROVAL_TOKEN="$(tr -d '\r\n' <"$ARTIFACTS/policy_approval.out")"
+must policy_approved_send "$BIN" --socket "$SOCKET" send base "$APPROVED_POLICY_CMD" --approval "$APPROVAL_TOKEN"
+must policy_approved_wait "$BIN" --socket "$SOCKET" wait base --until "approved-policy" --timeout 10s
+must policy_approved_replay "$BIN" --socket "$SOCKET" replay base
+assert_contains "$ARTIFACTS/policy_approved_replay.out" "policy approval created"
+assert_contains "$ARTIFACTS/policy_approved_replay.out" "policy approved"
+record policy_approval
 
 must prompt_send "$BIN" --socket "$SOCKET" send base 'printf "ready? "; read answer; printf "answer=%s\n" "$answer"'
 must prompt_wait_ready "$BIN" --socket "$SOCKET" wait base --until "ready?" --timeout 10s
@@ -349,6 +360,7 @@ grep -F "Unix CLI: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "HTTP: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "MCP: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "human attach: ok" "$ARTIFACTS/report.md" >/dev/null
+grep -F "policy approval: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "tmux reconnect: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "daemon restart replay: ok" "$ARTIFACTS/report.md" >/dev/null
 grep -F "fork comparison: ok" "$ARTIFACTS/report.md" >/dev/null

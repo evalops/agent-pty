@@ -3,54 +3,23 @@ use std::{
     io::{BufRead, BufReader, ErrorKind, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, mpsc},
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     evidence::EvidenceEvent,
+    policy::{ActionPolicy, PolicyApprovalGrant},
     session::{
         ForkResult, ProofBundle, ScreenSnapshot, SessionConfig, SessionManager, SessionMetadata,
         SessionObservation, TraceEvent, WaitCondition,
     },
 };
-
-static DANGEROUS_COMMANDS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
-    vec![
-        (
-            Regex::new(r"(?i)(?:^|[;&|]\s*)(?:sudo\s+)?rm\s+-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\b")
-                .expect("valid rm -rf policy regex"),
-            "rm -rf",
-        ),
-        (
-            Regex::new(r"(?i)\bgit\s+push\b[^\n]*\s--force(?:-with-lease)?\b")
-                .expect("valid git push --force policy regex"),
-            "git push --force",
-        ),
-        (
-            Regex::new(r"(?i)\bterraform\s+apply\b").expect("valid terraform apply policy regex"),
-            "terraform apply",
-        ),
-        (
-            Regex::new(r"(?i)\bkubectl\s+delete\b").expect("valid kubectl delete policy regex"),
-            "kubectl delete",
-        ),
-        (
-            Regex::new(r"(?i)\bvault\s+write\b").expect("valid vault write policy regex"),
-            "vault write",
-        ),
-        (
-            Regex::new(r"(?i)\bgh\s+pr\s+merge\b").expect("valid gh pr merge policy regex"),
-            "gh pr merge",
-        ),
-    ]
-});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -69,6 +38,8 @@ pub enum Request {
         id: String,
         text: String,
         enter: bool,
+        #[serde(default)]
+        approval: Option<String>,
     },
     Screen {
         id: String,
@@ -93,6 +64,13 @@ pub enum Request {
         name: String,
         copy_worktree: bool,
     },
+    Approve {
+        id: String,
+        command: String,
+        #[serde(default)]
+        rule: Option<String>,
+        ttl_ms: u64,
+    },
     Attach {
         id: String,
         read_only: bool,
@@ -114,6 +92,7 @@ pub enum ResponsePayload {
     Sessions(Vec<SessionMetadata>),
     Proof(ProofBundle),
     Forked(ForkResult),
+    PolicyApproval(PolicyApprovalGrant),
     Attached,
     TracePath(PathBuf),
     Shutdown,
@@ -189,11 +168,13 @@ fn handle_request_inner(manager: &SessionManager, request: Request) -> Result<Re
             })?;
             Ok(ResponsePayload::SessionCreated { id })
         }
-        Request::Send { id, text, enter } => {
-            if let Some(rule) = action_policy_violation(&text) {
-                manager.record_policy_denial(&id, &text, rule)?;
-                bail!("{rule} requires approval before it can be sent to the PTY");
-            }
+        Request::Send {
+            id,
+            text,
+            enter,
+            approval,
+        } => {
+            manager.authorize_action_policy(&id, &text, approval.as_deref())?;
             if enter {
                 manager.send_line(&id, &text)?;
             } else {
@@ -229,6 +210,19 @@ fn handle_request_inner(manager: &SessionManager, request: Request) -> Result<Re
             &name,
             copy_worktree,
         )?)),
+        Request::Approve {
+            id,
+            command,
+            rule,
+            ttl_ms,
+        } => Ok(ResponsePayload::PolicyApproval(
+            manager.create_policy_approval(
+                &id,
+                &command,
+                rule.as_deref(),
+                Duration::from_millis(ttl_ms),
+            )?,
+        )),
         Request::Attach { .. } => bail!("attach is only supported by the Unix socket stream"),
         Request::TracePath => Ok(ResponsePayload::TracePath(
             manager.trace_path().to_path_buf(),
@@ -244,13 +238,10 @@ pub fn enforce_action_policy(text: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn action_policy_violation(text: &str) -> Option<&'static str> {
-    for (regex, label) in DANGEROUS_COMMANDS.iter() {
-        if regex.is_match(text) {
-            return Some(label);
-        }
-    }
-    None
+pub fn action_policy_violation(text: &str) -> Option<String> {
+    ActionPolicy::default()
+        .evaluate(text)
+        .map(|policy_match| policy_match.label)
 }
 
 impl Request {
@@ -265,6 +256,7 @@ impl Request {
             Request::List => "terminal.list",
             Request::Proof { .. } => "terminal.proof",
             Request::Fork { .. } => "terminal.fork",
+            Request::Approve { .. } => "terminal.approve",
             Request::Attach { .. } => "terminal.attach",
             Request::TracePath => "terminal.trace_path",
             Request::Shutdown => "terminal.shutdown",
@@ -282,6 +274,7 @@ impl Request {
             | Request::Replay { id }
             | Request::Proof { id }
             | Request::Fork { id, .. }
+            | Request::Approve { id, .. }
             | Request::Attach { id, .. } => Some(id.clone()),
             Request::List | Request::TracePath | Request::Shutdown => None,
         }
@@ -289,6 +282,14 @@ impl Request {
 }
 
 pub fn serve_unix(socket_path: impl AsRef<Path>, log_dir: impl Into<PathBuf>) -> Result<()> {
+    serve_unix_with_policy(socket_path, log_dir, ActionPolicy::default())
+}
+
+pub fn serve_unix_with_policy(
+    socket_path: impl AsRef<Path>,
+    log_dir: impl Into<PathBuf>,
+    policy: ActionPolicy,
+) -> Result<()> {
     let socket_path = socket_path.as_ref();
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
@@ -304,7 +305,7 @@ pub fn serve_unix(socket_path: impl AsRef<Path>, log_dir: impl Into<PathBuf>) ->
     listener
         .set_nonblocking(true)
         .context("set unix listener nonblocking")?;
-    let manager = Arc::new(SessionManager::new(log_dir)?);
+    let manager = Arc::new(SessionManager::new_with_policy(log_dir, policy)?);
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
     loop {

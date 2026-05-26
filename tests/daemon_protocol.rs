@@ -32,6 +32,7 @@ fn daemon_request_flow_controls_session_and_replays_events() {
             id: "codex-daemon".to_string(),
             text: "printf 'daemon-ok\\n'".to_string(),
             enter: true,
+            approval: None,
         },
     )
     .unwrap();
@@ -106,6 +107,7 @@ fn daemon_rejects_dangerous_commands_before_they_reach_the_pty() {
             id: "policy".to_string(),
             text: "rm -rf /tmp/agent-pty-policy-test".to_string(),
             enter: true,
+            approval: None,
         },
     )
     .unwrap_err()
